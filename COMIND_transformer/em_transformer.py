@@ -6,7 +6,8 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from .optimizer_theta import fit_theta
 from .optimizer_beta import estimate_beta_for_patient, beta_loss, beta_loss_jac
 from .optimizer_cognitive_regression import fit_linear_cog_regression_multi
-from .utils import solve_system, initialize_beta
+from .utils import *
+
 
 
 class EM(BaseEstimator, TransformerMixin):
@@ -97,7 +98,7 @@ class EM(BaseEstimator, TransformerMixin):
             n = len(patient["dt"])
             X_obs_list.append(patient["X_obs"])
             dt_list.append(patient["dt"])
-            cog_list.append(patient["cog"])
+            cog_list.append(ensure_2d_cog(patient["cog"], n)) 
             ids_list.append(np.full(n, i))  # integer index for patient
             if "initial_beta" in patient:
                 initial_beta_list.append(patient["initial_beta"])
@@ -187,7 +188,10 @@ class EM(BaseEstimator, TransformerMixin):
         for idx, pid in enumerate(np.unique(ids)): # each iter will be like (idx, pid)
             mask = (ids == pid)
             # print(np.size(mask), X_obs.shape, dt.shape, cog.shape)
-            X_obs_i, dt_i, cog_i = X_obs[mask,:], dt[mask], cog[mask,:]
+            X_obs_i = X_obs[mask,:]
+            dt_i = dt[mask]
+            cog_i = cog[mask,:]
+            beta_i = initial_beta[idx]
             beta_i = initial_beta[idx]
             
             if current_jac:

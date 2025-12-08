@@ -113,4 +113,41 @@ def set_diagonal_K(K: np.ndarray, s: float = 1.0, k: float = 0.05): # TODO: ask 
     K_diag = s * K + k * I
     return K_diag
     # then return K with a diag
+
+def ensure_2d_cog(c, n_rows_expected: int) -> np.ndarray:
+    c = np.asarray(c)
+    # (n_obs,) -> (n_obs, 1)
+    if c.ndim == 1:
+        c = c.reshape(-1, 1)
+
+    # (1, n_obs) -> (n_obs, 1)
+    if c.ndim == 2 and c.shape[0] == 1 and c.shape[1] == n_rows_expected:
+        c = c.T
+
+    # Final check: first dim must match number of observations for this patient
+    if c.ndim != 2 or c.shape[0] != n_rows_expected:
+        raise ValueError(
+            f"cog shape mismatch; expected first dim {n_rows_expected}, got {c.shape}"
+        )
+    return c
+
+def create_patient_list(X_obs, ids, dt, cog, nhy, initial_beta=None):
+    unique_ids = np.unique(ids)
+    id_to_index = {pid: idx for idx, pid in enumerate(unique_ids)}
+
+    patient_list = []
+    for pid in unique_ids:
+        mask = (ids == pid)
+        patient_data = {
+            "id": pid,
+            "X_obs": X_obs[mask],
+            "dt": dt[mask],
+            "cog": cog[mask],
+            "nhy": nhy[mask]
+        }
+        if initial_beta is not None:
+            patient_data["initial_beta"] = initial_beta[id_to_index[pid]]
+        patient_list.append(patient_data)
+
+    return patient_list
     

@@ -204,24 +204,51 @@ def plot_beta_overlay(df: pd.DataFrame, beta_iter: pd.DataFrame, theta_iter: pd.
     plt.legend()
     plt.show()
 
-def plot_beta_error_history(beta_iter: pd.DataFrame, df: pd.DataFrame, num_iterations: int) -> None:
+# def plot_beta_error_history(beta_iter: pd.DataFrame, df: pd.DataFrame, num_iterations: int) -> None:
+#     """
+#     Plots mean beta estimation error over EM iterations.
+#     """
+#     beta_error_history = []
+#     for iteration in range(num_iterations):
+#         beta_column = str(iteration)
+#         if beta_column in beta_iter.columns:
+#             beta_estimated = beta_iter[["patient_id", beta_column]].rename(columns={beta_column: "beta_estimated"})
+#             beta_diff = df[["patient_id", "beta_true"]].merge(beta_estimated, on="patient_id")
+#             beta_diff["beta_error"] = np.abs(beta_diff["beta_true"] - beta_diff["beta_estimated"])
+#             beta_error_history.append(beta_diff["beta_error"].mean())
+#     plt.figure(figsize=(10, 5))
+#     plt.plot(range(len(beta_error_history)), beta_error_history)
+#     plt.ylim([0, max(beta_error_history)])
+#     plt.xlabel("iteration")
+#     plt.ylabel("mean beta error")
+#     plt.show()
+
+def plot_beta_error_history(beta_history: np.ndarray, beta_true: np.ndarray) -> None:
     """
     Plots mean beta estimation error over EM iterations.
     """
-    beta_error_history = []
+    num_iterations = beta_history.shape[1]
+    beta_error_mean_history = np.zeros(num_iterations)
+    beta_error_std_history = np.zeros(num_iterations)
     for iteration in range(num_iterations):
-        beta_column = str(iteration)
-        if beta_column in beta_iter.columns:
-            beta_estimated = beta_iter[["patient_id", beta_column]].rename(columns={beta_column: "beta_estimated"})
-            beta_diff = df[["patient_id", "beta_true"]].merge(beta_estimated, on="patient_id")
-            beta_diff["beta_error"] = np.abs(beta_diff["beta_true"] - beta_diff["beta_estimated"])
-            beta_error_history.append(beta_diff["beta_error"].mean())
+        beta_estimated = beta_history[:, iteration]    
+        beta_error = np.abs(beta_estimated - beta_true)
+        beta_error_mean_history[iteration] = np.mean(beta_error)
+        beta_error_std_history[iteration] = np.std(beta_error)
+
     plt.figure(figsize=(10, 5))
-    plt.plot(range(len(beta_error_history)), beta_error_history)
-    plt.ylim([0, max(beta_error_history)])
-    plt.xlabel("iteration")
-    plt.ylabel("mean beta error")
+    plt.plot(range(len(beta_error_mean_history)), beta_error_mean_history)
+    plt.fill_between(range(len(beta_error_mean_history)),
+                     beta_error_mean_history - beta_error_std_history,
+                     beta_error_mean_history + beta_error_std_history,
+                     alpha = 0.2)
+    plt.ylim([0, max(beta_error_mean_history)])
+    plt.xticks(range(0,num_iterations))
+    plt.xlabel("Iteration")
+    plt.ylabel("Mean beta error")
+    plt.title("Beta error")
     plt.show()
+
     
 def plot_lse(lse_array: np.ndarray) -> None:
     """
@@ -233,6 +260,25 @@ def plot_lse(lse_array: np.ndarray) -> None:
     plt.xlabel("iteration")
     plt.ylabel("LSE")
     plt.show()
+
+# def plot_cog_regression_history(cog_history: np.ndarray, cog_true: np.ndarray):
+#     n_params, num_iterations = cog_history.shape
+    
+#     # cog_error = np.zeros_like(cog_history)
+#     # for i in range(num_iterations):
+#     #     cog_error[:,i] = cog_error[:,i] - cog_true
+    
+#     plt.figure(figsize=(10, 5))
+#     for i in range(n_params):
+#         label = f"a_{i}" if i < n_params - 1 else "b"
+#         plt.plot(range(num_iterations), cog_history[i,:], label=label)
+#     plt.legend()
+#     plt.xlabel("iteration")
+#     plt.ylabel("estimated coefficient value")
+#     plt.title("cog_parameters")
+#     plt.grid(True)
+#     plt.show()
+    
 
 def plot_cog_regression_history(cog_history: np.ndarray, labels: list):
     n_params, num_iterations = cog_history.shape
@@ -247,7 +293,49 @@ def plot_cog_regression_history(cog_history: np.ndarray, labels: list):
     plt.grid(True)
     plt.show()
 
+def plot_beta_estimates_on_groundtruth(beta_history: np.ndarray,
+                                       beta_true: np.ndarray,
+                                       t: np.ndarray,
+                                       x_true: np.ndarray,
+                                       n_biomarkers: int,
+                                       patient_idx: list = None) -> None:
+    """
+    overlays predicted and true beta (onset) values for selected patients 
+    on groundtruth biomarker trajectories. each patient gets a unique color.
+    """
+    if patient_idx is None:
+        patient_idx = [0, 1, 2, 3, 4]
 
+    # deduplicate: assume 3 observations per patient
+    beta_pred = beta_history[::3, -1]  # (n_patients,)
+
+    colors = plt.get_cmap("tab10").colors
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+
+    # plot true biomarker trajectories
+    for i in range(n_biomarkers):
+        ax.plot(t, x_true[i], color="k", alpha=0.5, linewidth=1)
+
+    for i, patient in enumerate(patient_idx):
+        color = colors[i % len(colors)]
+
+        beta_t = beta_true[patient]
+        beta_p = beta_pred[patient]
+
+        ax.axvline(x=beta_t, color=color, linestyle="-", label=f"true (P{patient})")
+        ax.axvline(x=beta_p, color=color, linestyle="--", label=f"pred (P{patient})")
+
+    # remove duplicate legend entries
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=8)
+
+    ax.set_title("Predicted vs. True Onset (Beta) per Patient")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Biomarker Value")
+    plt.tight_layout()
+    plt.show()
 
 def plot_all_patient_regression_lines_grid_nhy(X, dt, ids, beta, t_span, nhy, model=None,
                                                biomarker_indices=None, biomarker_labels=None,
