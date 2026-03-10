@@ -48,7 +48,7 @@ def theta_loss(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
 
     residuals = x_obs - x_pred
     loss = np.sum(residuals**2) + lambda_f * np.sum(np.abs(f)) + lambda_scalar * scalar_K**2
-    #loss = np.sum(residuals**2) + lambda_f * np.sum(np.abs(f)) + scalar_K**2
+    # loss = np.sum(residuals**2) + lambda_f * np.sum(np.abs(f)) + scalar_K**2
 
     return loss
    
@@ -94,7 +94,7 @@ def theta_loss_jac(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
     x_pred = np.zeros_like(x_obs) # (n_obs, n_biomarkers)
     # print("Breakpoint 2 Theta: ", x_pred.shape, t_obs.shape, t_span.shape, x_scaled.shape)
     for j in range(n_biomarkers):
-        x_pred[:,j] = np.interp(t_obs, t_span, x_scaled[j], )
+        x_pred[:,j] = np.interp(t_obs, t_span, x_scaled[j])
 
     residuals = x_obs - x_pred
     loss = np.sum(residuals**2) + lambda_f * np.sum(np.abs(f)) + lambda_scalar * (scalar_K**2)
@@ -162,55 +162,67 @@ def fit_theta(X_obs: np.ndarray, dt_obs: np.ndarray, ids: np.ndarray, K: np.ndar
     tuple
         x0_fixed (np.ndarray), f_fit (np.ndarray)
     """
+def fit_theta_subject(X_obs_i,
+                      dt_i,
+                      beta_i,
+                      K,
+                      t_span,
+                      use_jacobian,
+                      lambda_f,
+                      lambda_scalar,
+                      f_init=None,
+                      s_init=None,
+                      scalar_K_init=None,
+                      rng=None,
+                      bounds_scale=1.0):
+    """
+    Optimize theta for a single patient with fixed beta.
+    Returns f_fit, s_fit, scalar_K_fit.
+    """
     if rng is None:
         rng = np.random.default_rng(75)
-        
-    unique_ids = np.unique(ids)
-    id_to_index = {pid: i for i, pid in enumerate(unique_ids)}
-    index_array = np.array([id_to_index[i] for i in ids])  # shape: (n_obs,)
-    t_pred = dt_obs + beta_pred[index_array]
-    
-    #print("t_pred: ", t_pred.shape)
-    # t_pred = dt_obs + beta_pred[ids]
-    
-    # fixed vars
-    n_biomarkers = X_obs.shape[1]
+
+    n_biomarkers = X_obs_i.shape[1]
     x0_fixed = np.zeros(n_biomarkers)
-    
-    # inital guesses if None
-    if f_guess is None:
-        f_guess = rng.uniform(0, 0.2, size=n_biomarkers)
-    if s_guess is None:
-        s_guess = np.ones(n_biomarkers)
-    if scalar_K_guess is None:
-        scalar_K_guess = 1.0
-    
-    initial_params = np.concatenate([f_guess, s_guess, [scalar_K_guess]])
-    
+
+    # build observation times with fixed beta
+    t_obs = dt_i + beta_i
+
+    # initial guesses
+    if f_init is None:
+        f_init = rng.uniform(0.0, 0.2, size=n_biomarkers)
+    if s_init is None:
+        s_init = np.ones(n_biomarkers)
+    if scalar_K_init is None:
+        scalar_K_init = 1.0
+
+    initial_params = np.concatenate([f_init, s_init, [scalar_K_init]])
+
     # bounds
     bounds_f = [(0.0, np.inf)] * n_biomarkers
-    bounds_s = [(0.0, np.inf)] * n_biomarkers  # supremum scaling
-    bounds_scalar_K = [(0.0, np.inf)] 
-
+    bounds_s = [(0.0, np.inf)] * n_biomarkers
+    bounds_scalar_K = [(0.0, np.inf)]
     bounds = bounds_f + bounds_s + bounds_scalar_K
-     
-    if use_jacobian == True:
-        loss_function = theta_loss_jac
+
+    if use_jacobian:
+        loss_fn = theta_loss_jac
+        jac_flag = True
     else:
-        loss_function = theta_loss
+        loss_fn = theta_loss
+        jac_flag = False
 
     result = minimize(
-        loss_function,
+        loss_fn,
         initial_params,
-        args=(t_pred, X_obs, K, t_span, lambda_f, lambda_scalar),
+        args=(t_obs, X_obs_i, K, t_span, lambda_f, lambda_scalar),
         method="L-BFGS-B",
-        jac=use_jacobian,
+        jac=jac_flag,
         bounds=bounds
     )
 
-    fitted_params = result.x
-    f_fit = fitted_params[:n_biomarkers]
-    s_fit = fitted_params[n_biomarkers:2*n_biomarkers]
-    scalar_K_fit = fitted_params[-1]
-    
-    return x0_fixed, f_fit, s_fit, scalar_K_fit
+    fitted = result.x
+    f_fit = fitted[:n_biomarkers]
+    s_fit = fitted[n_biomarkers:2*n_biomarkers]
+    scalar_K_fit = fitted[-1]
+
+    return f_fit, s_fit, scalar_K_fit
