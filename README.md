@@ -1,7 +1,6 @@
 # COMIND: Connectome-based Monotonic Inference of Neurodegenerative Dynamics
 
 [![arXiv](https://img.shields.io/badge/arXiv-2508.10343-b31b1b.svg)](https://arxiv.org/abs/2508.10343)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 COMIND is a mechanistic, connectome-constrained disease progression model for neurodegeneration. It models regional biomarker accumulation as a system of coupled logistic-diffusion trajectories over a structural brain connectome, enabling scalable and interpretable inference and disease subtype discovery from longitudinal neuroimaging data.
 
