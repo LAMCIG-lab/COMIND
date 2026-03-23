@@ -506,7 +506,8 @@ def estimate_beta(beta_all: np.ndarray, X_obs: np.ndarray, dt: np.ndarray,
                   lambda_beta: float = 0.0, beta_mean: float = None, beta_var: float = None,
                   t_max: float = 12.0,
                   jsd_n_bins: int = None, jsd_bandwidth: float = None,
-                  jsd_value_range: tuple = None) -> tuple:
+                  jsd_value_range: tuple = None,
+                  kappa: np.ndarray = None) -> tuple:
     """
     Vectorized estimation of beta values for all patients simultaneously.
     
@@ -574,7 +575,7 @@ def estimate_beta(beta_all: np.ndarray, X_obs: np.ndarray, dt: np.ndarray,
     for subtype in range(len(cluster_f)):
         f_cluster = np.ravel(cluster_f[subtype])
         X_pred_by_cluster[subtype] = solve_system(
-            np.zeros(n_biomarkers), f_cluster, K, t_span, scalar_K
+            np.zeros(n_biomarkers), f_cluster, K, t_span, scalar_K, kappa
         )
 
     def loss_func(beta_vec):

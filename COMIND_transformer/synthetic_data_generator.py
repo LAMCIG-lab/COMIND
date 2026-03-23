@@ -40,7 +40,10 @@ def generate_synthetic_data(n_biomarkers: int = 10, t_max: float = 12, noise_lev
         rng = np.random.default_rng(seed)
 
     if x_true is None or t is None:
-        t, x_true, _K, _x0, _f, _scalar_K = generate_logistic_model(n_biomarkers=n_biomarkers, t_max=t_max)
+        # Ignore connectivity and kappa details here; use defaults for simple synthetic generation.
+        t, x_true, _K, _x0, _f, _scalar_K, _kappa = generate_logistic_model(
+            n_biomarkers=n_biomarkers, t_max=t_max
+        )
 
     # sanity: need room for n_patient_obs visits with unit spacing
     assert n_patient_obs * 1.0 < t_max, "t_max must be larger than n_patient_obs for unit visit spacing."

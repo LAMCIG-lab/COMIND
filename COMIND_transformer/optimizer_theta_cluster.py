@@ -6,7 +6,7 @@ from .utils import solve_system
 
 def theta_cluster_loss(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
                        K: np.ndarray, t_span: np.ndarray, s: np.ndarray, scalar_K: float,
-                       lambda_f: float) -> float:
+                       lambda_f: float, kappa: np.ndarray = None) -> float:
     """
     Computes loss for optimizing cluster-level f (with fixed global s and scalar_K).
     
@@ -35,16 +35,16 @@ def theta_cluster_loss(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
         Loss value.
     """
     n_biomarkers = x_obs.shape[1]
-    
     f = params
     x0 = np.zeros(n_biomarkers)
-    
-    x = solve_system(x0, f, K, t_span, scalar_K)
+
+    x = solve_system(x0, f, K, t_span, scalar_K, kappa)
     x_scaled = s[:, None] * x
-    
+
+    t_obs_clamped = np.clip(t_obs, t_span[0], t_span[-1])
     x_pred = np.zeros_like(x_obs)  # (n_obs, n_biomarkers)
     for j in range(n_biomarkers):
-        x_pred[:, j] = np.interp(t_obs, t_span, x_scaled[j])
+        x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
     
     residuals = x_obs - x_pred
     loss = np.sum(residuals**2) + lambda_f * np.sum(np.abs(f))
@@ -53,7 +53,7 @@ def theta_cluster_loss(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
 
 def theta_cluster_loss_jac(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
                            K: np.ndarray, t_span: np.ndarray, s: np.ndarray, scalar_K: float,
-                           lambda_f: float) -> tuple:
+                           lambda_f: float, kappa: np.ndarray = None) -> tuple:
     """
     Computes loss and gradient for optimizing cluster-level f (with fixed global s and scalar_K).
     
@@ -82,16 +82,17 @@ def theta_cluster_loss_jac(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndar
         Loss scalar and gradient vector grad_f.
     """
     n_biomarkers = x_obs.shape[1]
-    
     f = params
     x0 = np.zeros(n_biomarkers)
-    
-    x = solve_system(x0, f, K, t_span, scalar_K)
+
+    x = solve_system(x0, f, K, t_span, scalar_K, kappa)
     x_scaled = s[:, None] * x
-    
+
+    t_obs_clamped = np.clip(t_obs, t_span[0], t_span[-1])
+
     x_pred = np.zeros_like(x_obs)  # (n_obs, n_biomarkers)
     for j in range(n_biomarkers):
-        x_pred[:, j] = np.interp(t_obs, t_span, x_scaled[j])
+        x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
     
     residuals = x_obs - x_pred
     loss = np.sum(residuals**2) + lambda_f * np.sum(np.abs(f))
@@ -103,11 +104,11 @@ def theta_cluster_loss_jac(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndar
         cumulative_simpson(1 - x[i], x=t_span, initial=0)
         for i in range(n_biomarkers)
     ])
-    
+
     df_obs = np.zeros_like(x_obs)
     for i in range(n_biomarkers):
-        cs_integ = CubicSpline(t_span, cum_int[i], extrapolate=True)
-        df_obs[:, i] = cs_integ(t_obs)
+        cs_integ = CubicSpline(t_span, cum_int[i], extrapolate=False)
+        df_obs[:, i] = cs_integ(t_obs_clamped)
     
     # Need to account for s scaling: d/ds(s*x) with respect to f
     grad_f = -2 * np.sum(residuals * (df_obs * s[None, :]), axis=0) + np.sign(f) * lambda_f
@@ -120,7 +121,8 @@ def fit_theta_cluster(X_obs: np.ndarray, dt_obs: np.ndarray, ids: np.ndarray, K:
                       lambda_f: float,
                       beta_pred: np.ndarray = None,
                       f_guess: np.ndarray = None,
-                      rng: np.random.Generator = None) -> np.ndarray:
+                      rng: np.random.Generator = None,
+                      kappa: np.ndarray = None) -> np.ndarray:
     """
     Optimizes cluster-level f for patients in a specific cluster (with fixed global s and scalar_K).
     
@@ -177,17 +179,17 @@ def fit_theta_cluster(X_obs: np.ndarray, dt_obs: np.ndarray, ids: np.ndarray, K:
         loss_function = theta_cluster_loss_jac
     else:
         loss_function = theta_cluster_loss
-    
+
     result = minimize(
         loss_function,
         f_guess,
-        args=(t_pred, X_obs, K, t_span, s, scalar_K, lambda_f),
+        args=(t_pred, X_obs, K, t_span, s, scalar_K, lambda_f, kappa),
         method="L-BFGS-B",
         jac=use_jacobian,
         bounds=bounds
     )
     
     f_fit = result.x
-    
+
     return f_fit
 

@@ -5,7 +5,7 @@ from scipy.optimize import linear_sum_assignment
 import statsmodels.formula.api as smf
 from typing import Sequence
 
-def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarray, scalar_K: float = 1.0) -> np.ndarray: #, alpha: float = 1.0) -> np.ndarray:
+def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarray, scalar_K: float = 1.0, kappa: np.ndarray = None) -> np.ndarray:
     """
     Solves the multivariate logistic ODE system given initial conditions and parameters.
 
@@ -19,18 +19,24 @@ def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarra
         Connectivity matrix.
     t_span : np.ndarray
         Array of time points to solve over.
-
+    scalar_K : float
+        Scalar for the connectivity matrix.
+    kappa : np.ndarray
+        Diag of K, representing self-propagation
     Returns
     -------
     np.ndarray
         Simulated biomarker trajectories of shape (n_biomarkers, len(t_span)).
     """
-    # eps = 1e-2
+    if kappa is None:
+        kappa = np.zeros(K.shape[0])
+    K_eff = scalar_K * K + np.diag(kappa)
     
     def ode_system(t, x):
         # x = np.clip(x, 0.0 + eps, 1.0 - eps)  # prevent overshoot near upper bound
-        dxdt =  (np.eye(K.shape[0]) - np.diag(x)) @ ((scalar_K * K @ x) + f) # TODO: double check position of f wrt parenthesis
-        return dxdt
+        # K_eff already includes scalar_K: K_eff = scalar_K * K + diag(kappa)
+        dxdt =  (np.eye(K.shape[0]) - np.diag(x)) @ ((K_eff @ x) + f)
+        return dxdt 
     # def jacobian_ode(t, x):
     #     J = (1 - x)[:, None] * K
     #     J[np.diag_indices_from(J)] = -((K @ x) + f)
@@ -44,8 +50,9 @@ def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarra
     #     return J
     
     def jacobian_ode(t, x):
-        J = (1 - x)[:, None] * (scalar_K * K)
-        J[np.diag_indices_from(J)] = -(scalar_K * (K @ x) + f)
+        J = (1 - x)[:, None] * (K_eff)
+        # J = (1 - x)[:, None] * (scalar_K * K)
+        J[np.diag_indices_from(J)] = -((K_eff @ x) + f)
         return J    
 
     sol = solve_ivp(

@@ -632,6 +632,8 @@ def plot_true_vs_predicted_subtype_trajectories(
     n_biomarkers: int,
     solve_system_fn,
     subtype_mapping: Optional[np.ndarray] = None,
+    kappa_true: Optional[np.ndarray] = None,
+    kappa_pred: Optional[np.ndarray] = None,
 ) -> None:
     """
     Overlay true vs predicted biomarker trajectories for each fitted subtype.
@@ -646,6 +648,10 @@ def plot_true_vs_predicted_subtype_trajectories(
         Optional mapping array where mapping[fitted_subtype] = true_subtype.
         If provided, number of panels = len(f_pred_list) and each panel compares
         fitted trajectory to the mapped true subtype.
+    kappa_true : Optional[np.ndarray]
+        Global true kappa vector (shape: n_biomarkers). If None, zeros are used.
+    kappa_pred : Optional[np.ndarray]
+        Global fitted kappa vector (shape: n_biomarkers). If None, zeros are used.
     """
     n_fitted = len(f_pred_list)
     if n_fitted == 0:
@@ -654,6 +660,7 @@ def plot_true_vs_predicted_subtype_trajectories(
         raise ValueError(
             f"scalar_K_pred_list must have length {n_fitted} (number of fitted subtypes), got {len(scalar_K_pred_list)}."
         )
+
     if subtype_mapping is not None:
         if len(subtype_mapping) != n_fitted:
             raise ValueError(
@@ -672,6 +679,21 @@ def plot_true_vs_predicted_subtype_trajectories(
         if n_fitted != n_subtypes:
             raise ValueError("When subtype_mapping is None, len(f_pred_list) must equal n_subtypes.")
 
+    # Global kappa handling
+    if kappa_true is None:
+        kappa_true_arr = np.zeros(n_biomarkers, dtype=float)
+    else:
+        kappa_true_arr = np.asarray(kappa_true, dtype=float)
+        if kappa_true_arr.shape != (n_biomarkers,):
+            raise ValueError(f"kappa_true must have shape ({n_biomarkers},), got {kappa_true_arr.shape}.")
+
+    if kappa_pred is None:
+        kappa_pred_arr = np.zeros(n_biomarkers, dtype=float)
+    else:
+        kappa_pred_arr = np.asarray(kappa_pred, dtype=float)
+        if kappa_pred_arr.shape != (n_biomarkers,):
+            raise ValueError(f"kappa_pred must have shape ({n_biomarkers},), got {kappa_pred_arr.shape}.")
+
     colors = sns.color_palette("deep", n_biomarkers)
     fig, axes = plt.subplots(n_fitted, 1, figsize=(10, max(3 * n_fitted, 4)), sharex=True)
     if n_fitted == 1:
@@ -679,6 +701,7 @@ def plot_true_vs_predicted_subtype_trajectories(
 
     for subtype in range(n_fitted):
         ax = axes[subtype]
+
         # Map to true subtype if mapping provided
         if subtype_mapping is not None:
             true_subtype_idx = int(subtype_mapping[subtype])
@@ -691,8 +714,9 @@ def plot_true_vs_predicted_subtype_trajectories(
         f_pred = np.asarray(f_pred_list[subtype])
         scalar_pred = float(scalar_K_pred_list[subtype])
 
-        traj_true = solve_system_fn(np.zeros(n_biomarkers), f_true, K, t_span, scalar_true)
-        traj_pred = solve_system_fn(np.zeros(n_biomarkers), f_pred, K, t_span, scalar_pred)
+        # Pass kappa to solver (global, shared across subtypes)
+        traj_true = solve_system_fn(np.zeros(n_biomarkers), f_true, K, t_span, scalar_true, kappa_true_arr)
+        traj_pred = solve_system_fn(np.zeros(n_biomarkers), f_pred, K, t_span, scalar_pred, kappa_pred_arr)
 
         for biom_idx in range(n_biomarkers):
             color = colors[biom_idx % len(colors)]

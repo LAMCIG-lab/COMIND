@@ -30,6 +30,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 lambda_scalar: float = 0.0,
                 lambda_jsd: float = 0.0,  # JSD regularization for beta separation
                 lambda_beta: float = 0.0,  # L2 regularization on beta values
+                lambda_kappa: float = 0.0,
                  
                  # [initial guesses]
                  initial_f: np.ndarray = None, 
@@ -69,6 +70,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.lambda_scalar = lambda_scalar
         self.lambda_jsd = lambda_jsd
         self.lambda_beta = lambda_beta
+        self.lambda_kappa = lambda_kappa
         
         # [initial guesses]
         self.initial_f = initial_f
@@ -183,6 +185,25 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         
         # Initialize current scalar_K (global, not per-cluster)
         current_scalar_K = initial_scalar_K
+
+        # Initialize global kappa from top eigen-based forcing pattern (reuse eigen initializer, no jitter)
+        try:
+            from .utils import initialize_f_eigen
+            # Single subtype, no jitter/sparsity: returns shape (1, n_biomarkers)
+            kappa_init = initialize_f_eigen(
+                K=K,
+                n_subtypes=1,
+                n_eigs=min(8, n_biomarkers),
+                jitter_strength=0.0,
+                jitter=False,
+                sparsity_mask=False,
+                rng=self.rng,
+            )[0]
+            # Ensure non-negative and within a reasonable scale
+            current_kappa = np.clip(kappa_init, 0.0, np.inf)
+        except Exception:
+            # Fallback: no eigen-based structure available
+            current_kappa = np.zeros(n_biomarkers)
         
         # cog regression params - per subtype
         initial_cog_a = np.ones(n_cog_features) # initialize a weight for each type of cog test
@@ -293,12 +314,14 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         while loop_iter < self.max_iter:
             hist_idx = loop_iter + 1
             
-            ## STEP 1: GLOBAL LEVEL --> update s and scalar_K 
-            current_s, current_scalar_K = fit_theta_globals(
+            ## STEP 1: GLOBAL LEVEL --> update s, kappa, and scalar_K 
+            current_s, current_kappa, current_scalar_K = fit_theta_globals(
                 X_obs=X_obs, dt_obs=dt, ids=ids, K=K,
                 t_span=self.t_span, use_jacobian=current_jac,
                 beta_pred=current_beta,
-                s_guess=current_s, scalar_K_guess=current_scalar_K,
+                s_guess=current_s,
+                kappa_guess=current_kappa,
+                scalar_K_guess=current_scalar_K,
                 lambda_s=0.0, lambda_scalar=self.lambda_scalar,
                 rng=rng,
                 assignments=assignments,
@@ -383,7 +406,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     lambda_f=self.lambda_f,
                     beta_pred=beta_cluster,
                     f_guess=f_guess_flat,
-                    rng=rng
+                    rng=rng,
+                    kappa=current_kappa
                 )
                 
                 # Ensure f_cluster is 1D before storing
@@ -410,7 +434,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 lambda_beta=self.lambda_beta,
                 beta_mean=beta_mean,
                 beta_var=beta_var,
-                t_max=self.t_max
+                t_max=self.t_max,
+                kappa=current_kappa
             )
             
             beta_history[:, hist_idx] = current_beta
@@ -484,6 +509,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.cluster_f = cluster_f
         self.final_scalar_K = current_scalar_K  # Global scalar_K
         self.final_s = current_s
+        self.final_kappa = current_kappa
         self.final_assignments = assignments
         self.subtype_mapping = None  # Will be set if compute_subtype_mapping is called
         
@@ -522,7 +548,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         # For transform, use first cluster as default
         f = np.ravel(cluster_f[0])  # Ensure 1D
         scalar_K = current_scalar_K  # Global scalar_K
-        self.X_pred = solve_system(np.zeros(n_biomarkers), f, self.K, self.t_span, scalar_K)
+        self.X_pred = solve_system(np.zeros(n_biomarkers), f, self.K, self.t_span, scalar_K, self.final_kappa)
 
         # Per-biomarker SSE for BIC (training residuals)
         self._n_obs_rows = X_obs.shape[0]
@@ -848,7 +874,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 theta_cluster = np.concatenate([f_cluster, self.final_s, [self.final_scalar_K]])
                 X_pred_cluster = solve_system(
                     np.zeros(n_biomarkers), f_cluster, self.K, 
-                    self.t_span, self.final_scalar_K
+                    self.t_span, self.final_scalar_K, self.final_kappa
                 )
                 
                 beta_guess = 10.0
@@ -869,7 +895,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             theta_assigned = np.concatenate([f_assigned, self.final_s, [self.final_scalar_K]])
             X_pred_assigned = solve_system(
                 np.zeros(n_biomarkers), f_assigned, self.K, 
-                self.t_span, self.final_scalar_K
+                self.t_span, self.final_scalar_K, self.final_kappa
             )
             
             beta_i = estimate_beta_for_patient(
@@ -916,7 +942,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         s = self.theta[n_biomarkers:2 * n_biomarkers]
         scalar_K = self.theta[-1]
 
-        X_pred = solve_system(np.zeros(n_biomarkers), f, self.K, self.t_span, scalar_K)
+        X_pred = solve_system(np.zeros(n_biomarkers), f, self.K, self.t_span, scalar_K, self.final_kappa)
 
         lse = 0.0
         for i, p in enumerate(X):
@@ -955,7 +981,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         for subtype in range(n_subtypes):
             f_cluster = np.ravel(cluster_f[subtype])
             X_pred_by_cluster.append(
-                solve_system(np.zeros(n_biomarkers), f_cluster, self.K, self.t_span, scalar_K)
+                solve_system(np.zeros(n_biomarkers), f_cluster, self.K, self.t_span, scalar_K, self.final_kappa)
             )
         for r in range(X_obs.shape[0]):
             patient_id = ids[r]
@@ -982,8 +1008,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         n_biomarkers = self.final_s.shape[0]
         n_subtypes = self.n_subtypes
 
-        # Global: s (n_biomarkers), time scale (1)
-        k = n_biomarkers + 1
+        # Global: s (n_biomarkers), kappa (counted per-active entry), time scale (1)
+        kappa_active = int(np.sum(self.final_kappa >= 0.01))
+        k = n_biomarkers + kappa_active + 1
 
         # Clinical params only if cognitive weight > 0
         if self.lambda_cog > 0 and hasattr(self, "cluster_cog_a") and self.cluster_cog_a:

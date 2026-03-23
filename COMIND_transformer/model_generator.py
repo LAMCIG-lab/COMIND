@@ -61,11 +61,11 @@ def get_adjacency_matrix(connectivity_matrix_type, n_biomarkers, rng):
     else:
         raise ValueError("Unknown connectivity matrix type")
 
-def multi_logistic_deriv_force(t, x, K, f):
+def multi_logistic_deriv_force(t, x, K_eff, f):
     """
     Compute the time derivative dx/dt for the multivariate logistic system.
 
-    dx/dt = (I - diag(x)) @ (K @ x + f)
+    dx/dt = (I - diag(x)) @ (K_eff @ x + f)
 
     Parameters
     ----------
@@ -73,8 +73,8 @@ def multi_logistic_deriv_force(t, x, K, f):
         Time point (unused, but required by ODE solver).
     x : np.ndarray
         State vector of biomarkers.
-    K : np.ndarray
-        Connectivity matrix.
+    K_eff : np.ndarray
+        Effective connectivity matrix (e.g. scalar_K * K + diag(kappa)).
     f : np.ndarray
         External forcing vector.
     alpha: float
@@ -85,7 +85,7 @@ def multi_logistic_deriv_force(t, x, K, f):
     dx_dt : np.ndarray
         Time derivative of the system.
     """
-    return (np.eye(K.shape[0]) - np.diag(x)) @ (K @ x + f)
+    return (np.eye(K_eff.shape[0]) - np.diag(x)) @ (K_eff @ x + f)
 
 def generate_logistic_model(n_biomarkers=10,
                             step=0.1,
@@ -95,7 +95,8 @@ def generate_logistic_model(n_biomarkers=10,
                             scalar_K = 1.0,
                             rng = None,
                             K = None,
-                            f = None):
+                            f = None,
+                            kappa: np.ndarray = None):
     """
     Generate a synthetic multivariate logistic progression model.
     dx/dt = (I - diag(x)) @ (K @ x + f)
@@ -144,20 +145,28 @@ def generate_logistic_model(n_biomarkers=10,
     if scalar_K is None:
         scalar_K = 1.0
 
+    if kappa is None:
+        # Default: no additional self-propagation beyond scalar_K * K
+        kappa = np.zeros(n_biomarkers, dtype=float)
+    else:
+        kappa = np.asarray(kappa, float)
+        assert kappa.shape == (n_biomarkers,), "kappa must have shape (n_biomarkers,)"
+
     #x0[x0 < 0.005] = 0  # probably unnecessary but just to get rid of some small values
     f[f < 0.005] = 0
-    
-    K = get_adjacency_matrix(connectivity_matrix_type, n_biomarkers, rng)
-    K_scaled = scalar_K * K
+
+    # Respect caller-provided K; only generate when K is None (handled above).
+    # Effective connectivity: scalar_K * K + diag(kappa)
+    K_eff = scalar_K * K + np.diag(kappa)
     
     sol = solve_ivp(multi_logistic_deriv_force,
                     t_span=[0, t_max],
                     y0=x0,
-                    args=(K_scaled, f),
+                    args=(K_eff, f),
                     t_eval=t_eval,
                     method="LSODA")
 
-    return sol.t, sol.y, K, x0, f, scalar_K
+    return sol.t, sol.y, K, x0, f, scalar_K, kappa
 
 def create_patient_list(X_obs, ids, dt, cog, initial_beta=None):
     unique_ids = np.unique(ids)

@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.optimize import minimize
 from scipy.interpolate import CubicSpline
+from scipy.integrate import cumulative_simpson
 from .utils import solve_system
 
 # Log-normal prior center for scalar_K (penalty pulls toward this value)
@@ -12,143 +13,47 @@ def theta_s_loss(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
                  K: np.ndarray, t_span: np.ndarray, f: np.ndarray,
                  lambda_s: float = 0.0, lambda_scalar: float = 0.0) -> float:
     """
-    Computes loss for optimizing global scaling parameter s and scalar_K.
-    
-    Parameters
-    ----------
-    params : np.ndarray
-        Current guess: [s, scalar_K] where s is (n_biomarkers,) and scalar_K is scalar.
-    t_obs : np.ndarray
-        Observation times.
-    x_obs : np.ndarray
-        Observed biomarker values (shape: n_obs x n_biomarkers).
-    K : np.ndarray
-        Connectivity matrix.
-    t_span : np.ndarray
-        Time points for trajectory simulation.
-    f : np.ndarray
-        Fixed forcing term (shape: n_biomarkers).
-    lambda_s : float
-        Regularization strength for s (optional).
-    lambda_scalar : float
-        Regularization strength for scalar_K (optional).
-        
-    Returns
-    -------
-    float
-        Loss value.
+    Wrapper around `theta_s_loss_multi` for the single-f (no subtype) case.
+    Uses a single subtype with all observations assigned to it.
     """
-    n_biomarkers = x_obs.shape[1]
-    s = params[:n_biomarkers]
-    scalar_K = params[-1]
-    
-    x0 = np.zeros(n_biomarkers)
-    x = solve_system(x0, f, K, t_span, scalar_K)
-    x_scaled = s[:, None] * x
-    
-    x_pred = np.zeros_like(x_obs)  # (n_obs, n_biomarkers)
-    for j in range(n_biomarkers):
-        x_pred[:, j] = np.interp(t_obs, t_span, x_scaled[j])
-    
-    residuals = x_obs - x_pred
-    # loss = np.sum(residuals**2) + lambda_s * np.sum(s**2) + lambda_scalar * scalar_K**2  # old L2
-    scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
-    lognorm_penalty = 0.5 * lambda_scalar * (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) ** 2
-    loss = np.sum(residuals**2) + lambda_s * np.sum(s**2) + lognorm_penalty
-
-    return loss
+    n_obs = x_obs.shape[0]
+    cluster_f = [f]
+    observation_assignments = np.zeros(n_obs, dtype=int)
+    return theta_s_loss_multi(
+        params, t_obs, x_obs, K, t_span,
+        cluster_f, observation_assignments,
+        lambda_s, lambda_scalar
+    )
 
 def theta_s_loss_jac(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
                      K: np.ndarray, t_span: np.ndarray, f: np.ndarray,
                      lambda_s: float = 0.0, lambda_scalar: float = 0.0) -> tuple:
     """
-    Computes loss and gradient for optimizing global scaling parameter s and scalar_K.
-    
-    Parameters
-    ----------
-    params : np.ndarray
-        Current guess: [s, scalar_K] where s is (n_biomarkers,) and scalar_K is scalar.
-    t_obs : np.ndarray
-        Observation times.
-    x_obs : np.ndarray
-        Observed biomarker values (shape: n_obs x n_biomarkers).
-    K : np.ndarray
-        Connectivity matrix.
-    t_span : np.ndarray
-        Time points for trajectory simulation.
-    f : np.ndarray
-        Fixed forcing term (shape: n_biomarkers).
-    lambda_s : float
-        Regularization strength for s (optional).
-    lambda_scalar : float
-        Regularization strength for scalar_K (optional).
-        
-    Returns
-    -------
-    tuple
-        Loss scalar and gradient vector [grad_s, grad_scalar_K].
+    Wrapper around `theta_s_loss_jac_multi` for the single-f (no subtype) case.
+    Uses a single subtype with all observations assigned to it.
     """
-    n_biomarkers = x_obs.shape[1]
-    s = params[:n_biomarkers]
-    scalar_K = params[-1]
-    
-    x0 = np.zeros(n_biomarkers)
-    x = solve_system(x0, f, K, t_span, scalar_K)
-    x_scaled = s[:, None] * x
-    
-    x_pred = np.zeros_like(x_obs)  # (n_obs, n_biomarkers)
-    for j in range(n_biomarkers):
-        x_pred[:, j] = np.interp(t_obs, t_span, x_scaled[j])
-    
-    residuals = x_obs - x_pred
-    # loss = np.sum(residuals**2) + lambda_s * np.sum(s**2) + lambda_scalar * scalar_K**2  # old L2
-    scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
-    lognorm_penalty = 0.5 * lambda_scalar * (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) ** 2
-    loss = np.sum(residuals**2) + lambda_s * np.sum(s**2) + lognorm_penalty
-
-    # Gradient with respect to s
-    # d/ds (s * x) = x, so gradient of residual^2 is -2 * residuals * x_pred / s
-    # But x_pred = s * x_interp, so we need to use x_interp (unscaled)
-    x_interp = np.zeros_like(x_obs)
-    for j in range(n_biomarkers):
-        x_interp[:, j] = np.interp(t_obs, t_span, x[j])
-    
-    grad_s = -2 * np.sum(residuals * x_interp, axis=0) + 2 * lambda_s * s
-    
-    # Gradient with respect to scalar_K
-    # Need to compute d/d(scalar_K) of x
-    from scipy.interpolate import CubicSpline
-    from scipy.integrate import cumulative_simpson
-    
-    Kx_plus_f = (K @ x) + f[:, None]  # n_biomarkers x len(t_span)
-    scalar_expr = (1 - x) * Kx_plus_f
-    
-    scalar_obs = np.zeros_like(x_obs)
-    for i in range(n_biomarkers):
-        interp_fn = CubicSpline(t_span, scalar_expr[i], extrapolate=True)
-        scalar_obs[:, i] = interp_fn(t_obs)
-    
-    # Need to account for s scaling: d/ds(s*x) with respect to scalar_K
-    # grad_scalar_K = -2 * np.sum(residuals * (scalar_obs * s[None, :])) + 2 * lambda_scalar * scalar_K  # old L2
-    lognorm_grad = lambda_scalar * (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) / scalar_K_safe
-    grad_scalar_K = -2 * np.sum(residuals * (scalar_obs * s[None, :])) + lognorm_grad
-
-    grad = np.concatenate([grad_s, [grad_scalar_K]])
-    
-    return loss, grad
+    n_obs = x_obs.shape[0]
+    cluster_f = [f]
+    observation_assignments = np.zeros(n_obs, dtype=int)
+    return theta_s_loss_jac_multi(
+        params, t_obs, x_obs, K, t_span,
+        cluster_f, observation_assignments,
+        lambda_s, lambda_scalar
+    )
 
 
 def theta_s_loss_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
                        K: np.ndarray, t_span: np.ndarray, cluster_f: list,
                        observation_assignments: np.ndarray,
-                       lambda_s: float = 0.0, lambda_scalar: float = 0.0) -> float:
+                       lambda_s: float = 0.0, lambda_scalar: float = 0.0,
+                       kappa: np.ndarray = None) -> float:
     """
     Loss for s and scalar_K when each observation uses its assigned subtype's f.
     observation_assignments[i] = subtype index for the i-th observation row.
     """
     n_biomarkers = x_obs.shape[1]
-    n_obs = x_obs.shape[0]
     s = params[:n_biomarkers]
+    kappa = params[n_biomarkers:-1]
     scalar_K = params[-1]
     x0 = np.zeros(n_biomarkers)
 
@@ -157,7 +62,7 @@ def theta_s_loss_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
     x_scaled_list = []
     for k in range(n_subtypes):
         f_k = np.ravel(cluster_f[k])
-        x_k = solve_system(x0, f_k, K, t_span, scalar_K)
+        x_k = solve_system(x0, f_k, K, t_span, scalar_K, kappa)
         x_scaled_k = s[:, None] * x_k
         x_scaled_list.append(x_scaled_k)
 
@@ -182,13 +87,15 @@ def theta_s_loss_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
 def theta_s_loss_jac_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
                            K: np.ndarray, t_span: np.ndarray, cluster_f: list,
                            observation_assignments: np.ndarray,
-                           lambda_s: float = 0.0, lambda_scalar: float = 0.0) -> tuple:
+                           lambda_s: float = 0.0, lambda_scalar: float = 0.0,
+                           kappa: np.ndarray = None) -> tuple:
     """
-    Loss and gradient for s and scalar_K when each observation uses its assigned subtype's f.
+    Loss and gradient for s, kappa, and scalar_K when each observation uses
+    its assigned subtype's forcing term f.
     """
     n_biomarkers = x_obs.shape[1]
-    n_obs = x_obs.shape[0]
     s = params[:n_biomarkers]
+    kappa = params[n_biomarkers:-1]
     scalar_K = params[-1]
     x0 = np.zeros(n_biomarkers)
     n_subtypes = len(cluster_f)
@@ -198,7 +105,7 @@ def theta_s_loss_jac_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndar
     x_scaled_list = []
     for k in range(n_subtypes):
         f_k = np.ravel(cluster_f[k])
-        x_k = solve_system(x0, f_k, K, t_span, scalar_K)
+        x_k = solve_system(x0, f_k, K, t_span, scalar_K, kappa)
         x_list.append(x_k)
         x_scaled_k = s[:, None] * x_k
         x_scaled_list.append(x_scaled_k)
@@ -208,11 +115,25 @@ def theta_s_loss_jac_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndar
     for k in range(n_subtypes):
         x_k = x_list[k]
         f_k = np.ravel(cluster_f[k])
-        Kx_plus_f = (K @ x_k) + f_k[:, None]
+        K_eff = scalar_K * K + np.diag(kappa)
+        Kx_plus_f = (K_eff @ x_k) + f_k[:, None]
         scalar_expr = (1 - x_k) * Kx_plus_f
         splines_scalar.append([
-            CubicSpline(t_span, scalar_expr[j], extrapolate=True)
+            CubicSpline(t_span, scalar_expr[j], extrapolate=False)
             for j in range(n_biomarkers)
+        ])
+
+    # Precompute splines for kappa
+    splines_kappa = []
+    for k in range(n_subtypes):
+        x_k = x_list[k]
+        cum_int_kappa = np.array([
+            cumulative_simpson((1 - x_k[b]) * x_k[b], x=t_span, initial=0)
+            for b in range(n_biomarkers)
+        ])
+        splines_kappa.append([
+            CubicSpline(t_span, cum_int_kappa[b], extrapolate=False)
+            for b in range(n_biomarkers)
         ])
 
     # Predictions and residuals: vectorize by subtype
@@ -226,7 +147,6 @@ def theta_s_loss_jac_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndar
             x_pred[mask_k, j] = np.interp(t_k, t_span, x_scaled_list[k][j])
 
     residuals = x_obs - x_pred
-    # loss = np.sum(residuals ** 2) + lambda_s * np.sum(s ** 2) + lambda_scalar * scalar_K ** 2  # old L2
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
     lognorm_penalty = 0.5 * lambda_scalar * (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) ** 2
     loss = np.sum(residuals ** 2) + lambda_s * np.sum(s ** 2) + lognorm_penalty
@@ -241,20 +161,37 @@ def theta_s_loss_jac_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndar
         x_interp_k = np.zeros((np.sum(mask_k), n_biomarkers))
         for j in range(n_biomarkers):
             x_interp_k[:, j] = np.interp(t_k, t_span, x_list[k][j])
-        grad_s = grad_s - 2 * np.sum(residuals[mask_k] * x_interp_k, axis=0)
-    grad_s = grad_s + 2 * lambda_s * s
+        grad_s -= 2 * np.sum(residuals[mask_k] * x_interp_k, axis=0)
+    grad_s += 2 * lambda_s * s
 
-    # Gradient for scalar_K: evaluate prebuilt splines per observation
+    # Gradient for kappa
+    grad_kappa = np.zeros(n_biomarkers)
+    for k in range(n_subtypes):
+        mask_k = (observation_assignments == k)
+        if not np.any(mask_k):
+            continue
+        t_k = np.clip(t_obs[mask_k], t_span[0], t_span[-1])
+        kappa_sens_k = np.zeros((np.sum(mask_k), n_biomarkers))
+        for b in range(n_biomarkers):
+            kappa_sens_k[:, b] = splines_kappa[k][b](t_k)
+        grad_kappa -= 2 * np.sum(residuals[mask_k] * (kappa_sens_k * s[None, :]), axis=0)
+
+    # Gradient for scalar_K: vectorized by subtype
     grad_scalar_K = 0.0
-    for i in range(n_obs):
-        a_i = int(observation_assignments[i])
-        scalar_obs_i = np.array([splines_scalar[a_i][j](t_obs[i]) for j in range(n_biomarkers)])
-        grad_scalar_K = grad_scalar_K - 2 * np.sum(residuals[i] * s * scalar_obs_i)
-    # grad_scalar_K = grad_scalar_K + 2 * lambda_scalar * scalar_K  # old L2
+    n_obs = x_obs.shape[0]
+    for k in range(n_subtypes):
+        mask_k = (observation_assignments == k)
+        if not np.any(mask_k):
+            continue
+        t_k = np.clip(t_obs[mask_k], t_span[0], t_span[-1])
+        scalar_obs_k = np.zeros((np.sum(mask_k), n_biomarkers))
+        for j in range(n_biomarkers):
+            scalar_obs_k[:, j] = splines_scalar[k][j](t_k)
+        grad_scalar_K -= 2 * np.sum(residuals[mask_k] * s[None, :] * scalar_obs_k)
     lognorm_grad = lambda_scalar * (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) / scalar_K_safe
-    grad_scalar_K = grad_scalar_K + lognorm_grad
+    grad_scalar_K += lognorm_grad
 
-    grad = np.concatenate([grad_s, [grad_scalar_K]])
+    grad = np.concatenate([grad_s, grad_kappa, [grad_scalar_K]])
     return loss, grad
 
 
@@ -262,7 +199,7 @@ def fit_theta_globals(X_obs: np.ndarray, dt_obs: np.ndarray, ids: np.ndarray, K:
                       t_span: np.ndarray, use_jacobian: bool,
                       f: np.ndarray = None,
                       beta_pred: np.ndarray = None,
-                      s_guess: np.ndarray = None, scalar_K_guess: float = None,
+                      s_guess: np.ndarray = None, scalar_K_guess: float = None, kappa_guess: np.ndarray = None,
                       lambda_s: float = 0.0, lambda_scalar: float = 0.0,
                       rng: np.random.Generator = None,
                       assignments: np.ndarray = None,
@@ -287,9 +224,12 @@ def fit_theta_globals(X_obs: np.ndarray, dt_obs: np.ndarray, ids: np.ndarray, K:
         s_guess = np.ones(n_biomarkers)
     if scalar_K_guess is None:
         scalar_K_guess = 1.0
-
-    initial_params = np.concatenate([s_guess, [scalar_K_guess]])
-    bounds = [(0.0, np.inf)] * n_biomarkers + [(0.0, np.inf)]
+    if kappa_guess is None:
+        kappa_guess = np.zeros(K.shape[0])
+    initial_params = np.concatenate([s_guess, kappa_guess, [scalar_K_guess]])
+    bounds = ([(0.0, np.inf)] * n_biomarkers +             # s bounds
+              [(0.0, np.inf)] * n_biomarkers +             # kappa bounds
+              [(0.0, np.inf)])                             # scalar_K bound
 
     use_multi = (assignments is not None and cluster_f is not None)
     if use_multi:
@@ -319,6 +259,7 @@ def fit_theta_globals(X_obs: np.ndarray, dt_obs: np.ndarray, ids: np.ndarray, K:
 
     fitted_params = result.x
     s_fit = fitted_params[:n_biomarkers]
+    kappa_fit = fitted_params[n_biomarkers:-1]
     scalar_K_fit = fitted_params[-1]
 
-    return s_fit, scalar_K_fit
+    return s_fit, kappa_fit,scalar_K_fit
