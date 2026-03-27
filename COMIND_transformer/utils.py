@@ -5,70 +5,88 @@ from scipy.optimize import linear_sum_assignment
 import statsmodels.formula.api as smf
 from typing import Sequence
 
-def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarray, scalar_K: float = 1.0, kappa: np.ndarray = None) -> np.ndarray:
-    """
-    Solves the multivariate logistic ODE system given initial conditions and parameters.
+import jax
+import jax.numpy as jnp
+from ormatex_py.ode_sys import OdeSys, CustomJacLinOp
+from ormatex_py import integrate_wrapper
 
-    Parameters
-    ----------
-    x0 : np.ndarray
-        Initial state vector (typically zeros).
-    f : np.ndarray
-        Forcing term vector.
-    K : np.ndarray
-        Connectivity matrix.
-    t_span : np.ndarray
-        Array of time points to solve over.
-    scalar_K : float
-        Scalar for the connectivity matrix.
-    kappa : np.ndarray
-        Diag of K, representing self-propagation
-    Returns
-    -------
-    np.ndarray
-        Simulated biomarker trajectories of shape (n_biomarkers, len(t_span)).
-    """
+class MultivariateLogistic(OdeSys):
+    # K_eff has scalar_K and kappa already baked in: K_eff = scalar_K * K + kappa * I
+    K_eff: jnp.ndarray  # (n, n) effective connectivity matrix
+    f: jnp.ndarray      # (n,)   forcing vector
+
+    def __init__(self, K_eff, f, **kwargs):
+        super().__init__()
+        self.K_eff = jnp.array(K_eff)
+        self.f     = jnp.array(f)
+
+    @jax.jit
+    def _frhs(self, t, x, **kwargs):
+        # dx/dt = (I - diag(x)) @ (K_eff @ x + f)
+        #
+        # g = total driving force per region:
+        #     network input (K_eff @ x) + external forcing (f)
+        g = self.K_eff @ x + self.f
+
+        # (1 - x) is the logistic saturation — element-wise scaling
+        # when x_i -> 1 (fully damaged), that region stops accumulating
+        return (1.0 - x) * g
+
+    @jax.jit
+    def _fjac(self, t, x, **kwargs):
+        # Jacobian of _frhs with respect to x
+        # J = (I - diag(x)) @ K_eff - diag(g)
+        #
+        # Off-diagonal entry J[i,j] = (1 - x_i) * K_eff[i,j]
+        #   — how much region j's damage affects region i's rate of change
+        #   — zero if i and j aren't connected in the brain network
+        #
+        # Diagonal entry J[i,i] = (1 - x_i) * K_eff[i,i] - g_i
+        #   — the self-feedback term, always negative (stabilizing)
+        n = len(x)
+        g = self.K_eff @ x + self.f
+
+        # build off-diagonal part: (1 - x_i) * K_eff[i,j] for all i,j
+        J = (1.0 - x)[:, None] * self.K_eff
+
+        # correct the diagonal: replace with -(K_eff @ x + f)_i
+        J = J.at[jnp.arange(n), jnp.arange(n)].set(-g)
+
+        # CustomJacLinOp wraps J so ORMATEX can use it in Krylov iterations
+        # it needs t, x, and the RHS function alongside the matrix
+        return CustomJacLinOp(t, x, self.frhs, J)
+
+
+def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarray,
+                 scalar_K: float = 1.0, kappa=None) -> np.ndarray:
+    n = K.shape[0]
+
+    # scalar kappa only — builds K_eff once before integration
     if kappa is None:
-        kappa = np.zeros(K.shape[0])
-    K_eff = scalar_K * K + np.diag(kappa)
-    
-    def ode_system(t, x):
-        # x = np.clip(x, 0.0 + eps, 1.0 - eps)  # prevent overshoot near upper bound
-        # K_eff already includes scalar_K: K_eff = scalar_K * K + diag(kappa)
-        dxdt =  (np.eye(K.shape[0]) - np.diag(x)) @ ((K_eff @ x) + f)
-        return dxdt 
-    # def jacobian_ode(t, x):
-    #     J = (1 - x)[:, None] * K
-    #     J[np.diag_indices_from(J)] = -((K @ x) + f)
-    #     return J
-    
-    # check parent function declaration for attributes
-    # def jacobian_ode(t, x, alpha = alpha) -> np.ndarray: # returns matrix
-    #     J = (1 - x)[:, None] * (alpha * K) # for non-diag
-    #     Kx_plus_f = alpha * (K @ x) + f # diagonal entries
-    #     J[np.diag_indices_from(J)] = -Kx_plus_f
-    #     return J
-    
-    def jacobian_ode(t, x):
-        J = (1 - x)[:, None] * (K_eff)
-        # J = (1 - x)[:, None] * (scalar_K * K)
-        J[np.diag_indices_from(J)] = -((K_eff @ x) + f)
-        return J    
+        kappa = 0.0
+    K_eff = scalar_K * K + float(kappa) * np.eye(n)
 
-    sol = solve_ivp(
-        ode_system,
-        [t_span[0], t_span[-1]],
-        x0,
-        t_eval=t_span,
-        method="LSODA",
-        jac=jacobian_ode,
-        # rtol=1e-8,#1e-6,
-        # atol=1e-10,#1e-8
-        # reminder: LSODA ignores min and max step
+    # convert t_span to ORMATEX format
+    # t_span is always uniform from your linspace so dt is constant
+    t0     = float(t_span[0])
+    dt     = float(t_span[1] - t_span[0])  # = self.step from SubtypingEM
+    nsteps = len(t_span) - 1               # = int(t_max / step) - 1
+
+    # create the ODE system and integrate
+    sys = MultivariateLogistic(K_eff, f)
+    res = integrate_wrapper.integrate(
+        sys,
+        jnp.array(x0, dtype=jnp.float64),
+        t0,
+        dt,
+        nsteps,
+        'exprb2',
+        max_krylov_dim=min(20, n),  # 20 is good for n=80, fine for n=3 too
+        iom=2,                      # incomplete orthogonalization, faster Arnoldi
     )
 
-
-    return sol.y
+    # res.y shape is (nsteps+1, n) — transpose to (n, M) to match original
+    return np.array(res.y).T
 
 def initialize_beta(ids: np.ndarray, beta_range: tuple = (0, 12), rng: np.random.Generator = None) -> np.ndarray:
     """
