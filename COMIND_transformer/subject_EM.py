@@ -2,8 +2,8 @@
 import numpy as np
 from tqdm import tqdm
 from sklearn.base import BaseEstimator, TransformerMixin
-from EMDPM.optimizer_theta_subject import fit_theta_subject
-from EMDPM.utils import solve_system
+from .optimizer_theta_subject import fit_theta_subject
+from .utils import solve_system
 
 class SubjectEM(BaseEstimator, TransformerMixin):
     """

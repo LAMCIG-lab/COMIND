@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comind"
+dynamic = ["version"]
+description = "Connectome-based Monotonic Inference of Neurodegenerative Dynamics"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Daniel Semchin", email = "dsemchin@hawk.illinoistech.edu" },
+]
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy>=1.11",
+    "scikit-learn",
+    "tqdm",
+    "statsmodels",
+    "matplotlib",
+    "seaborn",
+]
+
+[project.optional-dependencies]
+brain = ["visbrain"]
+
+[project.urls]
+Homepage = "https://github.com/LAMCIG-lab/COMIND"
+Repository = "https://github.com/LAMCIG-lab/COMIND"
+"Bug Tracker" = "https://github.com/LAMCIG-lab/COMIND/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "COMIND_transformer.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["COMIND_transformer*"]
