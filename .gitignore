@@ -1,9 +1,19 @@
-# Packaging artifacts
+# Packaging / setuptools / pip
 *.egg-info/
+*.egg
+.eggs/
 build/
 dist/
+pip-wheel-metadata/
+*.whl
 
-# Python bytecode/cache
+# Python bytecode / cache
 __pycache__/
 *.py[cod]
+*$py.class
 *.cpython-*.pyc
+
+# Virtual environments (if created inside the repo)
+.venv/
+venv/
+env/
