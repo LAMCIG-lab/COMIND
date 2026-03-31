@@ -311,6 +311,19 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         # Patient IDs in same order as current_beta/assignments (index i <-> unique_ids[i])
         unique_ids = np.unique(ids)
             
+        # Keep an explicit snapshot of the best accepted iterate so we can roll back
+        # if a trial step (often the final Jacobian toggle attempt) is worse.
+        best_state = {
+            "beta": current_beta.copy(),
+            "s": current_s.copy(),
+            "scalar_K": float(current_scalar_K),
+            "kappa": current_kappa.copy(),
+            "cluster_f": [np.ravel(f).copy() for f in cluster_f],
+            "cluster_cog_a": [a.copy() for a in cluster_cog_a],
+            "cluster_cog_b": list(cluster_cog_b),
+            "assignments": assignments.copy(),
+        }
+
         while loop_iter < self.max_iter:
             hist_idx = loop_iter + 1
             
@@ -437,23 +450,55 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 t_max=self.t_max,
                 kappa=current_kappa
             )
-            
-            beta_history[:, hist_idx] = current_beta
-            
-            # Store cluster parameters in history (for first cluster as representative)
-            # Note: In full implementation, you might want to store all cluster parameters
-            representative_theta = np.concatenate([np.ravel(cluster_f[0]), current_s, [current_scalar_K]])
-            theta_history[:, hist_idx] = representative_theta
 
-            # if self.use_jacobian and lse > best_lse and not jacobian_switched:
-            # if self.use_jacobian and best_lse - lse > 1e-3 * best_lse and not jacobian_switched:
-            
+            # --- acceptance / jacobian-toggle (order matters) ---
+            def _lse_reject_tol(ref: float) -> float:
+                """Tiny margin so float noise never counts as improvement/regression."""
+                if not np.isfinite(ref):
+                    return 0.0
+                return max(1e-12, 100.0 * np.spacing(float(ref)))
+
+            def _lse_improve_tol(ref: float) -> float:
+                """Meaningful improvement threshold for updating best_state snapshot."""
+                if not np.isfinite(ref):
+                    return 0.0
+                return max(1e-12, self.relative_tolerance * max(1.0, float(abs(ref))))
+
+            is_worse = np.isfinite(best_lse) and (lse > best_lse + _lse_reject_tol(best_lse))
             delta = best_lse - lse
-            
-            if (self.jac_toggle == True) and (delta < self.epsilon) and loop_iter > 3:# or lse > best_lse * (1 + self.relative_tolerance)):
-                if jacobian_switched == True: # early convergence detected
+
+            # 1) Reject regression before any Jacobian toggle (toggle used to share delta < epsilon).
+            if is_worse:
+                if self.verbose >= 2:
+                    print(
+                        f"Rejecting worse EM update at iter {loop_iter}: "
+                        f"lse={lse:.6f} > best_lse={best_lse:.6f} (tol={_lse_reject_tol(best_lse):.2e})"
+                    )
+                current_beta = best_state["beta"].copy()
+                current_s = best_state["s"].copy()
+                current_scalar_K = float(best_state["scalar_K"])
+                current_kappa = best_state["kappa"].copy()
+                cluster_f = [f.copy() for f in best_state["cluster_f"]]
+                assignments = best_state["assignments"].copy()
+                cluster_cog_a = [a.copy() for a in best_state["cluster_cog_a"]]
+                cluster_cog_b = list(best_state["cluster_cog_b"])
+                hist_idx = loop_iter
+                break
+
+            # 2) Stagnation / small step: optionally retry same EM index with Jacobian off.
+            if (self.jac_toggle == True) and (delta < self.epsilon) and loop_iter > 3:
+                if jacobian_switched == True:
                     if self.verbose >= 2:
                         print("L-BFGS and Nelder-Mead both failed to improve LSE, exiting early due to convergence")
+                    current_beta = best_state["beta"].copy()
+                    current_s = best_state["s"].copy()
+                    current_scalar_K = float(best_state["scalar_K"])
+                    current_kappa = best_state["kappa"].copy()
+                    cluster_f = [f.copy() for f in best_state["cluster_f"]]
+                    assignments = best_state["assignments"].copy()
+                    cluster_cog_a = [a.copy() for a in best_state["cluster_cog_a"]]
+                    cluster_cog_b = list(best_state["cluster_cog_b"])
+
                     for subtype in range(self.n_subtypes):
                         cluster_mask = (assignments == subtype)
                         if np.sum(cluster_mask) == 0:
@@ -468,39 +513,78 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                         cluster_cog_a[subtype], cluster_cog_b[subtype] = fit_linear_cog_regression_multi(
                             cog_subtype, dt_subtype, beta_subtype, ids_subtype
                         )
-                        cog_regression_history[subtype, :, hist_idx] = np.concatenate([cluster_cog_a[subtype], [cluster_cog_b[subtype]]])
-                    lse_history[hist_idx] = lse
-                    break 
-                
+                        cog_regression_history[subtype, :, loop_iter] = np.concatenate(
+                            [cluster_cog_a[subtype], [cluster_cog_b[subtype]]]
+                        )
+                    hist_idx = loop_iter
+                    break
+
+                # Current step is not worse (guarded above); if it improved best, save before jac-off retry.
+                if lse < best_lse - _lse_improve_tol(best_lse):
+                    best_lse = float(lse)
+                    best_state = {
+                        "beta": current_beta.copy(),
+                        "s": current_s.copy(),
+                        "scalar_K": float(current_scalar_K),
+                        "kappa": current_kappa.copy(),
+                        "cluster_f": [np.ravel(f).copy() for f in cluster_f],
+                        "cluster_cog_a": [a.copy() for a in cluster_cog_a],
+                        "cluster_cog_b": list(cluster_cog_b),
+                        "assignments": assignments.copy(),
+                    }
+
                 current_jac = False
                 if self.verbose >= 2:
                     print(f"warning: toggling to jac {current_jac}; due to increase or convergence in LSE at iteration {loop_iter}.")
                 jacobian_switched = True
                 continue
-            # if best_lse - lse > 1e-3 * best_lse
-                # continue # skip storing values for current iteration. if True --> DONT UPDATE and RETRY
-                
+
             ## update accepted
             jacobian_switched = False
             if self.jac_toggle == True:
                 current_jac = True
-            
-            best_lse = min(best_lse, lse)
-            # TODO: Get idx of best lse
+
+            if lse < best_lse - _lse_improve_tol(best_lse):
+                best_lse = float(lse)
+                best_state = {
+                    "beta": current_beta.copy(),
+                    "s": current_s.copy(),
+                    "scalar_K": float(current_scalar_K),
+                    "kappa": current_kappa.copy(),
+                    "cluster_f": [np.ravel(f).copy() for f in cluster_f],
+                    "cluster_cog_a": [a.copy() for a in cluster_cog_a],
+                    "cluster_cog_b": list(cluster_cog_b),
+                    "assignments": assignments.copy(),
+                }
+
+            beta_history[:, hist_idx] = current_beta
+            representative_theta = np.concatenate([np.ravel(cluster_f[0]), current_s, [current_scalar_K]])
+            theta_history[:, hist_idx] = representative_theta
             lse_history[hist_idx] = lse
-            
-            # Store cognitive regression params per subtype
+
             for subtype in range(self.n_subtypes):
-                cog_regression_history[subtype, :, hist_idx] = np.concatenate([cluster_cog_a[subtype], [cluster_cog_b[subtype]]])
+                cog_regression_history[subtype, :, hist_idx] = np.concatenate(
+                    [cluster_cog_a[subtype], [cluster_cog_b[subtype]]]
+                )
             
             loop_iter += 1
             pbar.update(1)
-            
-            
+
+        # Fitted parameters should match the best reconstruction LSE snapshot, not necessarily
+        # the last iterate (e.g. equal-LSE alternate params after a non-improving step).
+        current_beta = best_state["beta"].copy()
+        current_s = best_state["s"].copy()
+        current_scalar_K = float(best_state["scalar_K"])
+        current_kappa = best_state["kappa"].copy()
+        cluster_f = [f.copy() for f in best_state["cluster_f"]]
+        assignments = best_state["assignments"].copy()
+        cluster_cog_a = [a.copy() for a in best_state["cluster_cog_a"]]
+        cluster_cog_b = list(best_state["cluster_cog_b"])
+
         self.theta_history = theta_history[:, 0:hist_idx+1]
         self.beta_history = beta_history[:, 0:hist_idx+1]
         self.lse_history = lse_history[0:hist_idx+1]
-        self.lse_final = lse
+        self.lse_final = best_lse
 
         self.cog_regression_history = cog_regression_history[:, 0:hist_idx+1]
         self.assignment_history = assignment_history[:, 0:hist_idx+1]
@@ -1108,7 +1192,7 @@ def fit_subtyping_em_with_assignments(
             'assignment_history': em.assignment_history,
             'final_assignments': em.final_assignments,
             'initial_assignments': initial_assignments,
-            'final_lse': em.lse_history[-1] if len(em.lse_history) > 0 else np.inf,
+            'final_lse': em.lse_final if len(em.lse_history) > 0 else np.inf,
                 'success': True
         }
     except Exception as e:
