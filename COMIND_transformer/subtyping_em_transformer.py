@@ -14,6 +14,20 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     """
     EM algorithm for recovering disease progression model parameters
     and patient-specific time shifts from cross-sectional observations.
+
+    Global (s, kappa, scalar_K) and cluster (f) θ-steps use a staged optimizer when
+    ``jac_toggle`` is True: ``lbfgs_approx`` (SciPy finite differences on loss), then
+    ``lbfgs_exact`` (LSODA sensitivity equations), then ``nelder_mead``.
+    When ``jac_toggle`` is False, only ``nelder_mead`` is used for θ.
+
+    Each EM outer iteration starts from the cheapest stage. If the reconstruction LSE
+    does not improve enough vs. ``best_lse`` (``epsilon`` or ``relative_tolerance``),
+    the same iteration is retried from a checkpoint with the next stage; after an
+    accepted update, the next iteration again starts from the cheapest stage.
+
+    If, after exhausting those θ stages, the trial LSE is still not strictly below the
+    best LSE so far, EM exits early and restores parameters to the start of that outer
+    iteration (so ``final_*`` match the last improving state).
     """
 
     def __init__(self, 
@@ -157,11 +171,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     
         n_cog_features = cog.shape[1]
         
-        ## initialize jacobian logic
-        best_lse = np.inf # keep outside loop or else it resets
-        
-        current_jac = self.jac_toggle
-        jacobian_switched = False
+        ## staged θ optimizers (globals + cluster)
+        best_lse = np.inf
+        if self.jac_toggle:
+            solver_phases = ["lbfgs_approx", "lbfgs_exact", "nelder_mead"]
+        else:
+            solver_phases = ["nelder_mead"]
         
         ## initialize guesses
         # theta
@@ -222,7 +237,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             cog_regression_history[subtype, :, 0] = np.concatenate([initial_cog_a, [initial_cog_b]])
         
         ## Compute Initial LSE (pure reconstruction error, no regularization)
-        X_pred = solve_system(initial_x0, initial_f, K, self.t_span, scalar_K=current_scalar_K)
+        X_pred = solve_system(
+            initial_x0, initial_f, K, self.t_span, current_scalar_K, current_kappa
+        )
         initial_lse = 0.0
         
         for idx, pid in enumerate(np.unique(ids)): # each iter will be like (idx, pid)
@@ -311,199 +328,234 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         # Patient IDs in same order as current_beta/assignments (index i <-> unique_ids[i])
         unique_ids = np.unique(ids)
             
+        def _lse_improvement_acceptable(best, lse_val, eps, rel_tol):
+            """True if this EM trial improves reconstruction LSE enough vs. best so far."""
+            if not np.isfinite(lse_val):
+                return False
+            if not np.isfinite(best) or best == np.inf:
+                return True
+            delta = best - lse_val
+            if delta >= eps:
+                return True
+            denom = max(abs(best), 1e-12)
+            if delta / denom >= rel_tol:
+                return True
+            return False
+
         while loop_iter < self.max_iter:
             hist_idx = loop_iter + 1
-            
-            ## STEP 1: GLOBAL LEVEL --> update s, kappa, and scalar_K 
-            current_s, current_kappa, current_scalar_K = fit_theta_globals(
-                X_obs=X_obs, dt_obs=dt, ids=ids, K=K,
-                t_span=self.t_span, use_jacobian=current_jac,
-                beta_pred=current_beta,
-                s_guess=current_s,
-                kappa_guess=current_kappa,
-                scalar_K_guess=current_scalar_K,
-                lambda_s=0.0, lambda_scalar=self.lambda_scalar,
-                rng=rng,
-                assignments=assignments,
-                cluster_f=cluster_f
-            )
-            
-            ## STEP 2: RECOMPUTE CLUSTER ASSIGNMENTS (hard or jittered)
-            use_jitter_this_iter = (
-                self.assignments_jitter
-                and self.jitter_iter > 0
-                and (loop_iter % self.jitter_iter == 0)
-                and loop_iter > 0
-            )
-            if use_jitter_this_iter:
-                assignments, probs = self._update_assignments_jitter(
-                    X_obs, dt, ids, cog, current_beta,
-                    cluster_f, current_scalar_K, current_s,
-                    K, self.t_span, cluster_cog_a, cluster_cog_b,
-                    self.lambda_cog
-                )
-                self.assignment_probabilities_ = probs
-            else:
-                assignments = self._update_assignments(
-                    X_obs, dt, ids, cog, current_beta,
-                    cluster_f, current_scalar_K, current_s,
-                    K, self.t_span, cluster_cog_a, cluster_cog_b,
-                    self.lambda_cog
-                )
-            assignment_history[:, hist_idx] = assignments
-            
-            ## STEP 2.5: UPDATE COGNITIVE REGRESSION PARAMS PER SUBTYPE
-            for subtype in range(self.n_subtypes):
-                cluster_mask = (assignments == subtype)
-                if np.sum(cluster_mask) == 0:
-                    continue
-                cluster_patient_indices = np.where(cluster_mask)[0]
-                cluster_patient_ids = unique_ids[cluster_patient_indices]
-                cluster_patient_mask = np.isin(ids, cluster_patient_ids)
-                
-                cog_subtype = cog[cluster_patient_mask]
-                dt_subtype = dt[cluster_patient_mask]
-                ids_subtype = ids[cluster_patient_mask]
-                beta_subtype = current_beta[cluster_patient_indices]
-                
-                cluster_cog_a[subtype], cluster_cog_b[subtype] = fit_linear_cog_regression_multi(
-                    cog_subtype, dt_subtype, beta_subtype, ids_subtype
-                )
-            
-            ## STEP 3: CLUSTER LEVEL --> update f[subtype] for each cluster (scalar_K is now global)
-            # TODO: This should be run in parallel
-            for subtype in range(self.n_subtypes):
-                # get mask for patients in this cluster
-                cluster_mask = (assignments == subtype)
-                cluster_patient_indices = np.where(cluster_mask)[0]
-                
-                if len(cluster_patient_indices) == 0:
-                    # empty cluster - skip or reinitialize
-                    if self.verbose >= 2:
-                        print(f"Warning: Cluster {subtype} is empty at iteration {loop_iter}")
-                    continue
-                
-                # Get observations for patients in this cluster
-                cluster_patient_ids = unique_ids[cluster_patient_indices]
-                cluster_patient_mask = np.isin(ids, cluster_patient_ids)
-                X_obs_cluster = X_obs[cluster_patient_mask, :]
-                dt_cluster = dt[cluster_patient_mask]
-                ids_cluster = ids[cluster_patient_mask]
-                
-                # Map original patient indices to cluster-local indices
-                unique_cluster_ids = np.unique(ids_cluster)
-                cluster_id_to_local = {orig_id: local_idx for local_idx, orig_id in enumerate(unique_cluster_ids)}
-                ids_cluster_local = np.array([cluster_id_to_local[i] for i in ids_cluster])
-                beta_cluster = current_beta[cluster_patient_indices]
-                
-                # Update cluster parameters (only f, scalar_K is global)
-                # Ensure f_guess is 1D
-                f_guess_flat = np.ravel(cluster_f[subtype])
-                f_cluster = fit_theta_cluster(
-                    X_obs=X_obs_cluster, dt_obs=dt_cluster, ids=ids_cluster_local, K=K,
-                    t_span=self.t_span, use_jacobian=current_jac,
-                    s=current_s, scalar_K=current_scalar_K,
-                    lambda_f=self.lambda_f,
-                    beta_pred=beta_cluster,
-                    f_guess=f_guess_flat,
+
+            # Checkpoint: retry same outer iteration with a stronger θ-solver if LSE gain is too small
+            ck_s = np.copy(current_s)
+            ck_kappa = np.asarray(current_kappa, dtype=float).copy()
+            ck_scalar_K = float(current_scalar_K)
+            ck_cluster_f = [np.ravel(fc).copy() for fc in cluster_f]
+            ck_beta = np.copy(current_beta)
+            ck_assignments = np.copy(assignments)
+            ck_cog_a = [np.copy(a) for a in cluster_cog_a]
+            ck_cog_b = [float(b) for b in cluster_cog_b]
+
+            solver_phase_idx = 0
+
+            while True:
+                current_s = np.copy(ck_s)
+                current_kappa = np.copy(ck_kappa)
+                current_scalar_K = ck_scalar_K
+                cluster_f = [fc.copy() for fc in ck_cluster_f]
+                current_beta = np.copy(ck_beta)
+                assignments = np.copy(ck_assignments)
+                cluster_cog_a = [np.copy(a) for a in ck_cog_a]
+                cluster_cog_b = list(ck_cog_b)
+
+                current_solver = solver_phases[solver_phase_idx]
+
+                ## STEP 1: GLOBAL LEVEL --> update s, kappa, and scalar_K
+                current_s, current_kappa, current_scalar_K = fit_theta_globals(
+                    X_obs=X_obs, dt_obs=dt, ids=ids, K=K,
+                    t_span=self.t_span,
+                    solver_stage=current_solver,
+                    beta_pred=current_beta,
+                    s_guess=current_s,
+                    kappa_guess=current_kappa,
+                    scalar_K_guess=current_scalar_K,
+                    lambda_s=0.0, lambda_scalar=self.lambda_scalar,
                     rng=rng,
+                    assignments=assignments,
+                    cluster_f=cluster_f,
+                )
+
+                ## STEP 2: RECOMPUTE CLUSTER ASSIGNMENTS (hard or jittered)
+                use_jitter_this_iter = (
+                    self.assignments_jitter
+                    and self.jitter_iter > 0
+                    and (loop_iter % self.jitter_iter == 0)
+                    and loop_iter > 0
+                )
+                if use_jitter_this_iter:
+                    assignments, probs = self._update_assignments_jitter(
+                        X_obs, dt, ids, cog, current_beta,
+                        cluster_f, current_scalar_K, current_s,
+                        K, self.t_span, cluster_cog_a, cluster_cog_b,
+                        self.lambda_cog
+                    )
+                    self.assignment_probabilities_ = probs
+                else:
+                    assignments = self._update_assignments(
+                        X_obs, dt, ids, cog, current_beta,
+                        cluster_f, current_scalar_K, current_s,
+                        K, self.t_span, cluster_cog_a, cluster_cog_b,
+                        self.lambda_cog
+                    )
+
+                ## STEP 2.5: UPDATE COGNITIVE REGRESSION PARAMS PER SUBTYPE
+                for subtype in range(self.n_subtypes):
+                    cluster_mask = (assignments == subtype)
+                    if np.sum(cluster_mask) == 0:
+                        continue
+                    cluster_patient_indices = np.where(cluster_mask)[0]
+                    cluster_patient_ids = unique_ids[cluster_patient_indices]
+                    cluster_patient_mask = np.isin(ids, cluster_patient_ids)
+
+                    cog_subtype = cog[cluster_patient_mask]
+                    dt_subtype = dt[cluster_patient_mask]
+                    ids_subtype = ids[cluster_patient_mask]
+                    beta_subtype = current_beta[cluster_patient_indices]
+
+                    cluster_cog_a[subtype], cluster_cog_b[subtype] = fit_linear_cog_regression_multi(
+                        cog_subtype, dt_subtype, beta_subtype, ids_subtype
+                    )
+
+                ## STEP 3: CLUSTER LEVEL --> update f[subtype] for each cluster (scalar_K is now global)
+                for subtype in range(self.n_subtypes):
+                    cluster_mask = (assignments == subtype)
+                    cluster_patient_indices = np.where(cluster_mask)[0]
+
+                    if len(cluster_patient_indices) == 0:
+                        if self.verbose >= 2:
+                            print(f"Warning: Cluster {subtype} is empty at iteration {loop_iter}")
+                        continue
+
+                    cluster_patient_ids = unique_ids[cluster_patient_indices]
+                    cluster_patient_mask = np.isin(ids, cluster_patient_ids)
+                    X_obs_cluster = X_obs[cluster_patient_mask, :]
+                    dt_cluster = dt[cluster_patient_mask]
+                    ids_cluster = ids[cluster_patient_mask]
+
+                    unique_cluster_ids = np.unique(ids_cluster)
+                    cluster_id_to_local = {
+                        orig_id: local_idx for local_idx, orig_id in enumerate(unique_cluster_ids)
+                    }
+                    ids_cluster_local = np.array([cluster_id_to_local[i] for i in ids_cluster])
+                    beta_cluster = current_beta[cluster_patient_indices]
+
+                    f_guess_flat = np.ravel(cluster_f[subtype])
+                    f_cluster = fit_theta_cluster(
+                        X_obs=X_obs_cluster, dt_obs=dt_cluster, ids=ids_cluster_local, K=K,
+                        t_span=self.t_span,
+                        s=current_s, scalar_K=current_scalar_K,
+                        lambda_f=self.lambda_f,
+                        solver_stage=current_solver,
+                        beta_pred=beta_cluster,
+                        f_guess=f_guess_flat,
+                        rng=rng,
+                        kappa=current_kappa,
+                    )
+
+                    cluster_f[subtype] = np.ravel(f_cluster)
+
+                ## STEP 4: SUBJECT LEVEL BETA
+                current_beta, lse = estimate_beta(
+                    beta_all=current_beta,
+                    X_obs=X_obs,
+                    dt=dt,
+                    ids=ids,
+                    cog=cog,
+                    t_span=self.t_span,
+                    cluster_f=cluster_f,
+                    scalar_K=current_scalar_K,
+                    s=current_s,
+                    assignments=assignments,
+                    K=K,
+                    cog_a=cluster_cog_a,
+                    cog_b=cluster_cog_b,
+                    lambda_cog=self.lambda_cog,
+                    lambda_jsd=self.lambda_jsd,
+                    lambda_beta=self.lambda_beta,
+                    beta_mean=beta_mean,
+                    beta_var=beta_var,
+                    t_max=self.t_max,
                     kappa=current_kappa
                 )
-                
-                # Ensure f_cluster is 1D before storing
-                cluster_f[subtype] = np.ravel(f_cluster)
-            
-            ## STEP 4: SUBJECT LEVEL BETA --> update beta using cluster-level theta
-            # Vectorized optimization of all betas simultaneously with JSD included
-            current_beta, lse = estimate_beta(
-                beta_all=current_beta,
-                X_obs=X_obs,
-                dt=dt,
-                ids=ids,
-                cog=cog,
-                t_span=self.t_span,
-                cluster_f=cluster_f,
-                scalar_K=current_scalar_K,
-                s=current_s,
-                assignments=assignments,
-                K=K,
-                cog_a=cluster_cog_a,
-                cog_b=cluster_cog_b,
-                lambda_cog=self.lambda_cog,
-                lambda_jsd=self.lambda_jsd,
-                lambda_beta=self.lambda_beta,
-                beta_mean=beta_mean,
-                beta_var=beta_var,
-                t_max=self.t_max,
-                kappa=current_kappa
-            )
-            
+
+                acceptable = _lse_improvement_acceptable(
+                    best_lse, lse, self.epsilon, self.relative_tolerance
+                )
+                last_stage = solver_phase_idx >= len(solver_phases) - 1
+
+                if acceptable or last_stage:
+                    if not acceptable and last_stage and self.verbose >= 2:
+                        print(
+                            f"EM iter {loop_iter}: LSE improvement still below threshold after "
+                            f"{current_solver}; accepting anyway."
+                        )
+                    break
+
+                solver_phase_idx += 1
+                if self.verbose >= 2:
+                    print(
+                        f"EM iter {loop_iter}: LSE gain too small with {solver_phases[solver_phase_idx - 1]}; "
+                        f"retrying with {solver_phases[solver_phase_idx]}"
+                    )
+
+            # After exhausting θ solvers (inner loop always ends on acceptable or last stage): if
+            # reconstruction LSE did not strictly improve vs best so far, exit EM and keep the
+            # pre-iteration state (avoids committing worse parameters and trailing useless iterations).
+            if np.isfinite(best_lse) and lse >= best_lse:
+                if self.verbose >= 1:
+                    print(
+                        f"EM: reconstruction LSE did not improve vs best ({best_lse:.6g}); "
+                        f"trial LSE={lse:.6g}. Exiting early at outer iter {loop_iter}."
+                    )
+                current_s = np.copy(ck_s)
+                current_kappa = np.copy(ck_kappa)
+                current_scalar_K = ck_scalar_K
+                cluster_f = [fc.copy() for fc in ck_cluster_f]
+                current_beta = np.copy(ck_beta)
+                assignments = np.copy(ck_assignments)
+                cluster_cog_a = [np.copy(a) for a in ck_cog_a]
+                cluster_cog_b = list(ck_cog_b)
+                lse = float(best_lse)
+                break
+
+            # Accepted this outer iteration (possibly after escalating θ-solver)
             beta_history[:, hist_idx] = current_beta
-            
-            # Store cluster parameters in history (for first cluster as representative)
-            # Note: In full implementation, you might want to store all cluster parameters
-            representative_theta = np.concatenate([np.ravel(cluster_f[0]), current_s, [current_scalar_K]])
+            assignment_history[:, hist_idx] = assignments
+            representative_theta = np.concatenate(
+                [np.ravel(cluster_f[0]), current_s, [current_scalar_K]]
+            )
             theta_history[:, hist_idx] = representative_theta
 
-            # if self.use_jacobian and lse > best_lse and not jacobian_switched:
-            # if self.use_jacobian and best_lse - lse > 1e-3 * best_lse and not jacobian_switched:
-            
-            delta = best_lse - lse
-            
-            if (self.jac_toggle == True) and (delta < self.epsilon) and loop_iter > 3:# or lse > best_lse * (1 + self.relative_tolerance)):
-                if jacobian_switched == True: # early convergence detected
-                    if self.verbose >= 2:
-                        print("L-BFGS and Nelder-Mead both failed to improve LSE, exiting early due to convergence")
-                    for subtype in range(self.n_subtypes):
-                        cluster_mask = (assignments == subtype)
-                        if np.sum(cluster_mask) == 0:
-                            continue
-                        cluster_patient_indices = np.where(cluster_mask)[0]
-                        cluster_patient_ids = unique_ids[cluster_patient_indices]
-                        cluster_patient_mask = np.isin(ids, cluster_patient_ids)
-                        cog_subtype = cog[cluster_patient_mask]
-                        dt_subtype = dt[cluster_patient_mask]
-                        ids_subtype = ids[cluster_patient_mask]
-                        beta_subtype = current_beta[cluster_patient_indices]
-                        cluster_cog_a[subtype], cluster_cog_b[subtype] = fit_linear_cog_regression_multi(
-                            cog_subtype, dt_subtype, beta_subtype, ids_subtype
-                        )
-                        cog_regression_history[subtype, :, hist_idx] = np.concatenate([cluster_cog_a[subtype], [cluster_cog_b[subtype]]])
-                    lse_history[hist_idx] = lse
-                    break 
-                
-                current_jac = False
-                if self.verbose >= 2:
-                    print(f"warning: toggling to jac {current_jac}; due to increase or convergence in LSE at iteration {loop_iter}.")
-                jacobian_switched = True
-                continue
-            # if best_lse - lse > 1e-3 * best_lse
-                # continue # skip storing values for current iteration. if True --> DONT UPDATE and RETRY
-                
-            ## update accepted
-            jacobian_switched = False
-            if self.jac_toggle == True:
-                current_jac = True
-            
-            best_lse = min(best_lse, lse)
-            # TODO: Get idx of best lse
+            best_lse = min(best_lse, lse) if np.isfinite(best_lse) else lse
             lse_history[hist_idx] = lse
-            
-            # Store cognitive regression params per subtype
+
             for subtype in range(self.n_subtypes):
-                cog_regression_history[subtype, :, hist_idx] = np.concatenate([cluster_cog_a[subtype], [cluster_cog_b[subtype]]])
-            
+                cog_regression_history[subtype, :, hist_idx] = np.concatenate(
+                    [cluster_cog_a[subtype], [cluster_cog_b[subtype]]]
+                )
+
             loop_iter += 1
             pbar.update(1)
             
             
-        self.theta_history = theta_history[:, 0:hist_idx+1]
-        self.beta_history = beta_history[:, 0:hist_idx+1]
-        self.lse_history = lse_history[0:hist_idx+1]
+        # Use loop_iter+1 so early exit (no write for hist_idx=loop_iter+1) does not include a blank column.
+        _h = loop_iter + 1
+        self.theta_history = theta_history[:, 0:_h]
+        self.beta_history = beta_history[:, 0:_h]
+        self.lse_history = lse_history[0:_h]
         self.lse_final = lse
 
-        self.cog_regression_history = cog_regression_history[:, 0:hist_idx+1]
-        self.assignment_history = assignment_history[:, 0:hist_idx+1]
+        self.cog_regression_history = cog_regression_history[:, 0:_h]
+        self.assignment_history = assignment_history[:, 0:_h]
         
         # Store final cluster parameters
         self.cluster_f = cluster_f
