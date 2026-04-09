@@ -28,6 +28,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     If, after exhausting those θ stages, the trial LSE is still not strictly below the
     best LSE so far, EM exits early and restores parameters to the start of that outer
     iteration (so ``final_*`` match the last improving state).
+
+    Global kappa is initialized with ``Uniform(0, 1)`` per biomarker. ``kappa_history``
+    stores kappa after the initial setup (column 0) and after each accepted outer
+    iteration, aligned with ``beta_history`` / ``lse_history`` indexing.
     """
 
     def __init__(self, 
@@ -201,24 +205,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         # Initialize current scalar_K (global, not per-cluster)
         current_scalar_K = initial_scalar_K
 
-        # Initialize global kappa from top eigen-based forcing pattern (reuse eigen initializer, no jitter)
-        try:
-            from .utils import initialize_f_eigen
-            # Single subtype, no jitter/sparsity: returns shape (1, n_biomarkers)
-            kappa_init = initialize_f_eigen(
-                K=K,
-                n_subtypes=1,
-                n_eigs=min(8, n_biomarkers),
-                jitter_strength=0.0,
-                jitter=False,
-                sparsity_mask=False,
-                rng=self.rng,
-            )[0]
-            # Ensure non-negative and within a reasonable scale
-            current_kappa = np.clip(kappa_init, 0.0, np.inf)
-        except Exception:
-            # Fallback: no eigen-based structure available
-            current_kappa = np.zeros(n_biomarkers)
+        current_kappa = rng.uniform(0.0, 1.0, size=n_biomarkers)
         
         # cog regression params - per subtype
         initial_cog_a = np.ones(n_cog_features) # initialize a weight for each type of cog test
@@ -227,12 +214,14 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         ## initialize histories
         theta_history = np.zeros((initial_theta.shape[0], self.max_iter + 1)) # extra column added for initial guesses
         beta_history = np.zeros((n_patients, self.max_iter + 1))
+        kappa_history = np.zeros((n_biomarkers, self.max_iter + 1))
         lse_history = np.zeros(self.max_iter + 1)
         cog_regression_history = np.zeros((self.n_subtypes, n_cog_features + 1, self.max_iter + 1))  # per subtype
         
         ## Append initial values to histories
         theta_history[:, 0] = initial_theta
         beta_history[:, 0] = initial_beta
+        kappa_history[:, 0] = current_kappa
         for subtype in range(self.n_subtypes):
             cog_regression_history[subtype, :, 0] = np.concatenate([initial_cog_a, [initial_cog_b]])
         
@@ -534,6 +523,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 [np.ravel(cluster_f[0]), current_s, [current_scalar_K]]
             )
             theta_history[:, hist_idx] = representative_theta
+            kappa_history[:, hist_idx] = current_kappa
 
             best_lse = min(best_lse, lse) if np.isfinite(best_lse) else lse
             lse_history[hist_idx] = lse
@@ -551,6 +541,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         _h = loop_iter + 1
         self.theta_history = theta_history[:, 0:_h]
         self.beta_history = beta_history[:, 0:_h]
+        self.kappa_history = kappa_history[:, 0:_h]
         self.lse_history = lse_history[0:_h]
         self.lse_final = lse
 
@@ -1156,6 +1147,7 @@ def fit_subtyping_em_with_assignments(
             'run_index': run_index,
             'model': em,
             'beta_history': em.beta_history,
+            'kappa_history': em.kappa_history,
             'lse_history': em.lse_history,
             'assignment_history': em.assignment_history,
             'final_assignments': em.final_assignments,
@@ -1169,6 +1161,7 @@ def fit_subtyping_em_with_assignments(
             'run_index': run_index,
             'model': None,
             'beta_history': None,
+            'kappa_history': None,
             'lse_history': None,
             'assignment_history': None,
             'final_assignments': None,
