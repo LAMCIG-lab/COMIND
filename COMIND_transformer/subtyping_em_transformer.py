@@ -5,7 +5,7 @@ from tqdm import tqdm
 from sklearn.base import BaseEstimator, TransformerMixin
 from .optimizer_theta_globals import fit_theta_globals
 from .optimizer_theta_cluster import fit_theta_cluster
-from .optimizer_beta import estimate_beta_for_patient, estimate_beta, beta_loss, beta_loss_jac, reconstruction_sse
+from .optimizer_beta import estimate_beta, reconstruction_sse
 from .optimizer_cognitive_regression import fit_linear_cog_regression_multi
 from .kernel_jsd_multi import KernelJSDMulti
 from .utils import *
@@ -368,7 +368,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     kappa_guess=current_kappa,
                     scalar_K_guess=current_scalar_K,
                     lambda_s=0.0, lambda_scalar=self.lambda_scalar,
-                    rng=rng,
+                    lambda_kappa=self.lambda_kappa,
                     assignments=assignments,
                     cluster_f=cluster_f,
                 )
@@ -383,7 +383,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 if use_jitter_this_iter:
                     assignments, probs = self._update_assignments_jitter(
                         X_obs, dt, ids, cog, current_beta,
-                        cluster_f, current_scalar_K, current_s,
+                        cluster_f, current_scalar_K, current_kappa, current_s,
                         K, self.t_span, cluster_cog_a, cluster_cog_b,
                         self.lambda_cog
                     )
@@ -391,7 +391,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 else:
                     assignments = self._update_assignments(
                         X_obs, dt, ids, cog, current_beta,
-                        cluster_f, current_scalar_K, current_s,
+                        cluster_f, current_scalar_K, current_kappa, current_s,
                         K, self.t_span, cluster_cog_a, cluster_cog_b,
                         self.lambda_cog
                     )
@@ -604,7 +604,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
         return self
     
-    def _update_assignments(self, X_obs, dt, ids, cog, beta, cluster_f, scalar_K, s,
+    def _update_assignments(self, X_obs, dt, ids, cog, beta, cluster_f, scalar_K, kappa, s,
                             K, t_span, cluster_cog_a, cluster_cog_b, lambda_cog):
         """
         Update cluster assignments using hard assignment based on reconstruction error.
@@ -623,7 +623,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         for subtype in range(n_subtypes):
             f_cluster = np.ravel(cluster_f[subtype])
             X_pred_by_cluster.append(
-                solve_system(np.zeros(n_biomarkers), f_cluster, K, t_span, scalar_K)
+                solve_system(np.zeros(n_biomarkers), f_cluster, K, t_span, scalar_K, kappa)
             )
 
         for idx, patient_id in enumerate(unique_ids):
@@ -637,14 +637,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             best_subtype = 0
 
             for subtype in range(n_subtypes):
-                f_cluster = np.ravel(cluster_f[subtype])
-                theta_cluster = np.concatenate([f_cluster, s, [scalar_K]])
                 X_pred_cluster = X_pred_by_cluster[subtype]
-
-                error = beta_loss(
-                    beta_i, X_obs_i, dt_i, X_pred_cluster, t_span,
-                    cog_i, cluster_cog_a[subtype], cluster_cog_b[subtype], theta_cluster, lambda_cog
-                )
+                error = reconstruction_sse(beta_i, X_obs_i, dt_i, X_pred_cluster, t_span, s)
+                cog_pred = cog_i @ cluster_cog_a[subtype] + cluster_cog_b[subtype]
+                error += lambda_cog * np.sum((dt_i + beta_i - cog_pred) ** 2)
 
                 if error < best_error:
                     best_error = error
@@ -654,7 +650,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
         return assignments
 
-    def _update_assignments_jitter(self, X_obs, dt, ids, cog, beta, cluster_f, scalar_K, s,
+    def _update_assignments_jitter(self, X_obs, dt, ids, cog, beta, cluster_f, scalar_K, kappa, s,
                                   K, t_span, cluster_cog_a, cluster_cog_b, lambda_cog):
         """
         Jitter assignments for each patient form p_k = exp(-SSE_k)/sum_k exp(-SSE_k)
@@ -673,7 +669,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         for subtype in range(n_subtypes):
             f_cluster = np.ravel(cluster_f[subtype])
             X_pred_by_cluster.append(
-                solve_system(np.zeros(n_biomarkers), f_cluster, K, t_span, scalar_K)
+                solve_system(np.zeros(n_biomarkers), f_cluster, K, t_span, scalar_K, kappa)
             )
 
         for idx, patient_id in enumerate(unique_ids):
@@ -914,7 +910,6 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             
             for subtype in range(self.n_subtypes):
                 f_cluster = np.ravel(self.cluster_f[subtype])
-                theta_cluster = np.concatenate([f_cluster, self.final_s, [self.final_scalar_K]])
                 X_pred_cluster = solve_system(
                     np.zeros(n_biomarkers), f_cluster, self.K, 
                     self.t_span, self.final_scalar_K, self.final_kappa
@@ -922,40 +917,42 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 
                 beta_guess = 10.0
                 # Compute reconstruction error using subtype-specific cognitive params
-                error = beta_loss(
-                    beta_guess, X_obs_i, dt_i, X_pred_cluster, self.t_span,
-                    cog_i, self.cluster_cog_a[subtype], self.cluster_cog_b[subtype], 
-                    theta_cluster, effective_lambda_cog
+                error = reconstruction_sse(
+                    beta_guess, X_obs_i, dt_i, X_pred_cluster, self.t_span, self.final_s
                 )
+                cog_pred = cog_i @ self.cluster_cog_a[subtype] + self.cluster_cog_b[subtype]
+                error += effective_lambda_cog * np.sum((dt_i + beta_guess - cog_pred) ** 2)
                 
                 if error < best_error:
                     best_error = error
                     best_subtype = subtype
                     best_beta_guess = beta_guess
             
-            # Step 2: Compute beta using the assigned subtype's parameters
-            f_assigned = np.ravel(self.cluster_f[best_subtype])
-            theta_assigned = np.concatenate([f_assigned, self.final_s, [self.final_scalar_K]])
-            X_pred_assigned = solve_system(
-                np.zeros(n_biomarkers), f_assigned, self.K, 
-                self.t_span, self.final_scalar_K, self.final_kappa
-            )
-            
-            beta_i = estimate_beta_for_patient(
-                beta_i=best_beta_guess,
-                X_obs_i=X_obs_i,
-                dt_i=dt_i,
-                X_pred=X_pred_assigned,
+            # Step 2: Compute beta for this patient with fixed assigned subtype
+            patient_ids_local = np.zeros(len(dt_i), dtype=int)
+            beta_i_vec, _ = estimate_beta(
+                beta_all=np.array([best_beta_guess], dtype=float),
+                X_obs=X_obs_i,
+                dt=dt_i,
+                ids=patient_ids_local,
+                cog=cog_i,
                 t_span=self.t_span,
-                cog_i=cog_i,
-                cog_a=self.cluster_cog_a[best_subtype],
-                cog_b=self.cluster_cog_b[best_subtype],
-                theta=theta_assigned,
+                cluster_f=self.cluster_f,
+                scalar_K=self.final_scalar_K,
+                s=self.final_s,
+                assignments=np.array([best_subtype], dtype=int),
                 K=self.K,
+                cog_a=self.cluster_cog_a,
+                cog_b=self.cluster_cog_b,
                 lambda_cog=effective_lambda_cog,
-                use_jacobian=self.jac_toggle,
-                t_max=self.t_max
+                lambda_jsd=0.0,
+                lambda_beta=0.0,
+                beta_mean=None,
+                beta_var=None,
+                t_max=self.t_max,
+                kappa=self.final_kappa,
             )
+            beta_i = float(beta_i_vec[0])
             
             # Store results
             results[idx]['beta'] = beta_i

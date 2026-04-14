@@ -8,6 +8,22 @@ from .sensitivity_lsoda import (
     interp_sensitivity_at_obs,
 )
 
+SPARSE_PSEUDO_HUBER_DELTA = 0.01
+
+
+def _pseudo_huber_penalty(values: np.ndarray, delta: float = SPARSE_PSEUDO_HUBER_DELTA) -> float:
+    """Elementwise pseudo-Huber penalty summed over values."""
+    values = np.asarray(values, dtype=float)
+    scaled = values / delta
+    return float(np.sum((delta ** 2) * (np.sqrt(1.0 + scaled ** 2) - 1.0)))
+
+
+def _pseudo_huber_grad(values: np.ndarray, delta: float = SPARSE_PSEUDO_HUBER_DELTA) -> np.ndarray:
+    """Gradient of summed pseudo-Huber penalty w.r.t. values."""
+    values = np.asarray(values, dtype=float)
+    return values / np.sqrt(1.0 + (values / delta) ** 2)
+
+
 def theta_cluster_loss(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
                        K: np.ndarray, t_span: np.ndarray, s: np.ndarray, scalar_K: float,
                        lambda_f: float, kappa: np.ndarray = None) -> float:
@@ -51,7 +67,7 @@ def theta_cluster_loss(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
         x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
     
     residuals = x_obs - x_pred
-    loss = np.sum(residuals**2) + lambda_f * np.sum(np.abs(f))
+    loss = np.sum(residuals**2) + lambda_f * _pseudo_huber_penalty(f)
     
     return loss
 
@@ -99,7 +115,7 @@ def theta_cluster_loss_jac(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndar
         x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
     
     residuals = x_obs - x_pred
-    loss = np.sum(residuals**2) + lambda_f * np.sum(np.abs(f))
+    loss = np.sum(residuals**2) + lambda_f * _pseudo_huber_penalty(f)
     
     ### Gradient computations
     
@@ -115,7 +131,7 @@ def theta_cluster_loss_jac(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndar
         df_obs[:, i] = cs_integ(t_obs_clamped)
     
     # Need to account for s scaling: d/ds(s*x) with respect to f
-    grad_f = -2 * np.sum(residuals * (df_obs * s[None, :]), axis=0) + np.sign(f) * lambda_f
+    grad_f = -2 * np.sum(residuals * (df_obs * s[None, :]), axis=0) + lambda_f * _pseudo_huber_grad(f)
     
     return loss, grad_f
 
@@ -141,9 +157,9 @@ def theta_cluster_loss_jac_exact(params: np.ndarray, t_obs: np.ndarray, x_obs: n
         x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
 
     residuals = x_obs - x_pred
-    loss = np.sum(residuals**2) + lambda_f * np.sum(np.abs(f))
+    loss = np.sum(residuals**2) + lambda_f * _pseudo_huber_penalty(f)
 
-    grad_f = np.sign(f) * lambda_f
+    grad_f = lambda_f * _pseudo_huber_grad(f)
     for b in range(n_biomarkers):
         w_b = integrate_linear_sensitivity_lsoda(
             t_span, x, K_eff, K, f, "f_diag", b
