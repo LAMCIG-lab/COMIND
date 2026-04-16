@@ -597,7 +597,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self._n_obs_rows = X_obs.shape[0]
         self._sse_per_biomarker = self._compute_sse_per_biomarker(
             X_obs, dt, ids, current_beta, assignments,
-            cluster_f, current_s, current_scalar_K
+            cluster_f, current_s, current_scalar_K, current_kappa
         )
         # BIC on training data (lower is better)
         self.bic_ = self.bic(X=None)
@@ -1009,6 +1009,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         cluster_f: np.ndarray,
         s: np.ndarray,
         scalar_K: float,
+        kappa: np.ndarray,
     ) -> np.ndarray:
         """
         Sum of squared errors per biomarker on training data (same indexing as fit).
@@ -1021,7 +1022,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         for subtype in range(n_subtypes):
             f_cluster = np.ravel(cluster_f[subtype])
             X_pred_by_cluster.append(
-                solve_system(np.zeros(n_biomarkers), f_cluster, self.K, self.t_span, scalar_K, self.final_kappa)
+                solve_system(np.zeros(n_biomarkers), f_cluster, self.K, self.t_span, scalar_K, kappa)
             )
         for r in range(X_obs.shape[0]):
             patient_id = ids[r]
@@ -1038,18 +1039,20 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     def _bic_n_params(self) -> int:
         """
         Number of free parameters for BIC (population only; no subject-level beta).
-        K = n_biomarkers (s) + 1 (time scale) + (n_cog * n_subtypes if lambda_cog > 0)
-            + sum over subtypes of #(f_i >= 0.01). Entries with f < 0.01 are treated
-            as effectively zero (not counted) to avoid over-penalizing sparse subtypes.
+        K = n_biomarkers (s) + #(active kappa) + 1 (time scale)
+            + (n_cog * n_subtypes + n_subtypes if lambda_cog > 0)
+            + sum over subtypes of #(active f_i).
+        Small-magnitude parameters are treated as effectively zero for counting.
         """
-        if not hasattr(self, "final_s") or not hasattr(self, "cluster_f"):
+        if not hasattr(self, "final_s") or not hasattr(self, "cluster_f") or not hasattr(self, "final_kappa"):
             raise RuntimeError("fit() must be called before _bic_n_params()")
 
         n_biomarkers = self.final_s.shape[0]
         n_subtypes = self.n_subtypes
 
         # Global: s (n_biomarkers), kappa (counted per-active entry), time scale (1)
-        kappa_active = int(np.sum(self.final_kappa >= 0.01))
+        param_active_threshold = 0.01
+        kappa_active = int(np.sum(np.abs(self.final_kappa) >= param_active_threshold))
         k = n_biomarkers + kappa_active + 1
 
         # Clinical params only if cognitive weight > 0
@@ -1061,7 +1064,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             k += n_subtypes  # cog_b per subtype
 
         # Forcing terms: count f >= threshold per subtype (f < 0.01 treated as effectively zero)
-        f_param_threshold = 0.01
+        f_param_threshold = param_active_threshold
         for subtype in range(n_subtypes):
             f_sub = np.ravel(self.cluster_f[subtype])
             k += int(np.sum(f_sub >= f_param_threshold))
