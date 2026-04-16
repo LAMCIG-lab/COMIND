@@ -1253,11 +1253,3 @@ def run_multiple_initializations_parallel(
     print(f"Best initialization: run {best_idx_original} with LSE={best_result['final_lse']:.6f}")
     
     return successful_results, best_idx_in_successful
-
-
-def compute_mixture_assignments(logits):
-    pass
-
-
-def mix_subtype_embeddings(subtype_embeds, assignment_probs):
-    pass

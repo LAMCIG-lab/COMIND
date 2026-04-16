@@ -67,7 +67,8 @@ def theta_s_loss_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
         np.sum(residuals ** 2)
         + lambda_s * np.sum(s ** 2)
         + lognorm_penalty
-        + lambda_kappa * _pseudo_huber_penalty(kappa)
+        # + lambda_kappa * _pseudo_huber_penalty(kappa)
+        + lambda_kappa * np.sum(np.abs(kappa))
     )
     return loss
 
@@ -113,7 +114,8 @@ def theta_s_loss_jac_exact_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: n
         np.sum(residuals ** 2)
         + lambda_s * np.sum(s ** 2)
         + lognorm_penalty
-        + lambda_kappa * _pseudo_huber_penalty(kappa)
+        # + lambda_kappa * _pseudo_huber_penalty(kappa)
+        + lambda_kappa * np.sum(np.abs(kappa))
     )
 
     sens_records = []
@@ -150,7 +152,8 @@ def theta_s_loss_jac_exact_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: n
         for b in range(n_biomarkers):
             u_b_at = interp_sensitivity_at_obs(u_kappa[b], t_span, t_k)
             grad_kappa[b] -= 2.0 * np.sum(res_k * s[None, :] * u_b_at)
-    grad_kappa += lambda_kappa * _pseudo_huber_grad(kappa)
+    # grad_kappa += lambda_kappa * _pseudo_huber_grad(kappa)
+    grad_kappa += lambda_kappa * np.sign(kappa)
 
     grad_scalar_K += lambda_scalar * (
         (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) / scalar_K_safe
