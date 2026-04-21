@@ -1153,8 +1153,9 @@ def fit_subtyping_em_with_assignments(
             'final_assignments': em.final_assignments,
             'initial_assignments': initial_assignments,
             'final_lse': em.lse_history[-1] if len(em.lse_history) > 0 else np.inf,
-                'success': True
+            'success': True,
         }
+        return result
     except Exception as e:
         # Return a failed result with very high LSE so it won't be selected as best
         result = {

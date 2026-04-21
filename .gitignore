@@ -7,3 +7,7 @@ dist/
 __pycache__/
 *.py[cod]
 *.cpython-*.pyc
+
+# Ignore experiment results
+*.npz
+experiments/
