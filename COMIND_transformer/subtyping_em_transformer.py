@@ -95,79 +95,19 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         n_patients = len(patient_ids)
         n_biomarkers = X[0]["X_obs"].shape[1]
         self.t_span = np.linspace(0.0, self.t_max, int(self.t_max / self.step))
-        require_cognitive_data = (self.lambda_cog != 0.0)
 
         X_obs_list = []
         dt_list = []
         ids_list = []
         cog_list = []
         initial_beta_list = []
-        n_cog_features = None
-
-        # Infer cognitive feature dimension from available patients.
-        for i, patient in enumerate(X):
-            n = len(patient["dt"])
-            if "cog" not in patient or patient["cog"] is None:
-                if require_cognitive_data:
-                    raise ValueError(
-                        f"Patient index {i} is missing 'cog', but lambda_cog={self.lambda_cog} requires cognitive data."
-                    )
-                continue
-
-            cog_i = ensure_2d_cog(patient["cog"], n)
-            if cog_i.shape[1] == 0:
-                if require_cognitive_data:
-                    raise ValueError(
-                        f"Patient index {i} has empty cognitive feature dimension, but lambda_cog={self.lambda_cog} requires cognitive data."
-                    )
-                continue
-
-            if n_cog_features is None:
-                n_cog_features = cog_i.shape[1]
-            elif cog_i.shape[1] != n_cog_features:
-                raise ValueError(
-                    f"Inconsistent number of cognitive features: expected {n_cog_features}, got {cog_i.shape[1]} for patient index {i}."
-                )
-
-            if require_cognitive_data and not np.isfinite(cog_i).all():
-                raise ValueError(
-                    f"Patient index {i} has non-finite cognitive values, but lambda_cog={self.lambda_cog} requires complete cognitive data."
-                )
-
-        if n_cog_features is None:
-            if require_cognitive_data:
-                raise ValueError(
-                    f"No cognitive data found, but lambda_cog={self.lambda_cog} requires cognitive data."
-                )
-            # Placeholder dimension when cognitive prior is disabled.
-            n_cog_features = 1
 
         for i, patient in enumerate(X):
             n = len(patient["dt"])
             X_obs_list.append(patient["X_obs"])
             dt_list.append(patient["dt"])
             ids_list.append(np.full(n, i))
-            if "cog" in patient and patient["cog"] is not None:
-                cog_i = ensure_2d_cog(patient["cog"], n)
-                if cog_i.shape[1] != n_cog_features:
-                    raise ValueError(
-                        f"Patient index {i} has {cog_i.shape[1]} cognitive features, expected {n_cog_features}."
-                    )
-                if require_cognitive_data:
-                    if not np.isfinite(cog_i).all():
-                        raise ValueError(
-                            f"Patient index {i} has non-finite cognitive values, but lambda_cog={self.lambda_cog} requires complete cognitive data."
-                        )
-                else:
-                    cog_i = np.nan_to_num(cog_i, nan=0.0, posinf=0.0, neginf=0.0)
-            else:
-                if require_cognitive_data:
-                    raise ValueError(
-                        f"Patient index {i} is missing 'cog', but lambda_cog={self.lambda_cog} requires cognitive data."
-                    )
-                cog_i = np.zeros((n, n_cog_features), dtype=float)
-
-            cog_list.append(cog_i)
+            cog_list.append(ensure_2d_cog(patient["cog"], n)) 
             if "initial_beta" in patient:
                 initial_beta_list.append(patient["initial_beta"])
 
@@ -390,23 +330,22 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             assignment_history[:, hist_idx] = assignments
             
             ## STEP 2.5: UPDATE COGNITIVE REGRESSION PARAMS PER SUBTYPE
-            if self.lambda_cog != 0.0:
-                for subtype in range(self.n_subtypes):
-                    cluster_mask = (assignments == subtype)
-                    if np.sum(cluster_mask) == 0:
-                        continue
-                    cluster_patient_indices = np.where(cluster_mask)[0]
-                    cluster_patient_ids = unique_ids[cluster_patient_indices]
-                    cluster_patient_mask = np.isin(ids, cluster_patient_ids)
-                    
-                    cog_subtype = cog[cluster_patient_mask]
-                    dt_subtype = dt[cluster_patient_mask]
-                    ids_subtype = ids[cluster_patient_mask]
-                    beta_subtype = current_beta[cluster_patient_indices]
-                    
-                    cluster_cog_a[subtype], cluster_cog_b[subtype] = fit_linear_cog_regression_multi(
-                        cog_subtype, dt_subtype, beta_subtype, ids_subtype
-                    )
+            for subtype in range(self.n_subtypes):
+                cluster_mask = (assignments == subtype)
+                if np.sum(cluster_mask) == 0:
+                    continue
+                cluster_patient_indices = np.where(cluster_mask)[0]
+                cluster_patient_ids = unique_ids[cluster_patient_indices]
+                cluster_patient_mask = np.isin(ids, cluster_patient_ids)
+                
+                cog_subtype = cog[cluster_patient_mask]
+                dt_subtype = dt[cluster_patient_mask]
+                ids_subtype = ids[cluster_patient_mask]
+                beta_subtype = current_beta[cluster_patient_indices]
+                
+                cluster_cog_a[subtype], cluster_cog_b[subtype] = fit_linear_cog_regression_multi(
+                    cog_subtype, dt_subtype, beta_subtype, ids_subtype
+                )
             
             ## STEP 3: CLUSTER LEVEL --> update f[subtype] for each cluster (scalar_K is now global)
             # TODO: This should be run in parallel
@@ -490,22 +429,21 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 if jacobian_switched == True: # early convergence detected
                     if self.verbose >= 2:
                         print("L-BFGS and Nelder-Mead both failed to improve LSE, exiting early due to convergence")
-                    if self.lambda_cog != 0.0:
-                        for subtype in range(self.n_subtypes):
-                            cluster_mask = (assignments == subtype)
-                            if np.sum(cluster_mask) == 0:
-                                continue
-                            cluster_patient_indices = np.where(cluster_mask)[0]
-                            cluster_patient_ids = unique_ids[cluster_patient_indices]
-                            cluster_patient_mask = np.isin(ids, cluster_patient_ids)
-                            cog_subtype = cog[cluster_patient_mask]
-                            dt_subtype = dt[cluster_patient_mask]
-                            ids_subtype = ids[cluster_patient_mask]
-                            beta_subtype = current_beta[cluster_patient_indices]
-                            cluster_cog_a[subtype], cluster_cog_b[subtype] = fit_linear_cog_regression_multi(
-                                cog_subtype, dt_subtype, beta_subtype, ids_subtype
-                            )
-                            cog_regression_history[subtype, :, hist_idx] = np.concatenate([cluster_cog_a[subtype], [cluster_cog_b[subtype]]])
+                    for subtype in range(self.n_subtypes):
+                        cluster_mask = (assignments == subtype)
+                        if np.sum(cluster_mask) == 0:
+                            continue
+                        cluster_patient_indices = np.where(cluster_mask)[0]
+                        cluster_patient_ids = unique_ids[cluster_patient_indices]
+                        cluster_patient_mask = np.isin(ids, cluster_patient_ids)
+                        cog_subtype = cog[cluster_patient_mask]
+                        dt_subtype = dt[cluster_patient_mask]
+                        ids_subtype = ids[cluster_patient_mask]
+                        beta_subtype = current_beta[cluster_patient_indices]
+                        cluster_cog_a[subtype], cluster_cog_b[subtype] = fit_linear_cog_regression_multi(
+                            cog_subtype, dt_subtype, beta_subtype, ids_subtype
+                        )
+                        cog_regression_history[subtype, :, hist_idx] = np.concatenate([cluster_cog_a[subtype], [cluster_cog_b[subtype]]])
                     lse_history[hist_idx] = lse
                     break 
                 
@@ -859,37 +797,28 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     ) -> np.ndarray:
         """
         Estimate beta values (timeshift) and subtype assignments for a list of patient dicts.
-        
-        For each patient, this method:
-        1. Validates patient-level shapes and cognitive data.
-        2. Uses either:
-           - ``method="legacy"``: subtype screening at fixed beta=10 (clipped), then one beta optimization.
-           - ``method="multiple_inits"``: per-subtype multistart beta optimization from {10,20,30},
-             selecting subtype by lowest optimized loss.
-        3. Returns beta and subtype assignment in a structured array.
-        
+
+        When ``use_cognitive_prior`` is False, cognitive data are not used in the loss
+        (``lambda_cog`` is effectively zero). In that case, ``cog`` may be omitted, or
+        may have a different width than training: any incompatible ``cog`` is ignored and
+        replaced with zeros of the training width so matrix dimensions in ``beta_loss``
+        remain valid without imputing missing clinical scores.
+
         Parameters
         ----------
         X : list[dict]
-            List of patient dictionaries, each containing:
-            - 'X_obs': (n_visits, n_biomarkers) biomarker observations
-            - 'dt': (n_visits,) time deltas
-            - 'cog': (n_visits, n_cog_features) cognitive features
-        
-        Parameters
-        ----------
-        X : list[dict]
-            Patient dictionaries.
+            Patient dictionaries with ``X_obs``, ``dt``, and optionally ``cog``.
         use_cognitive_prior : bool, default=True
-            If False, ignore cognitive priors during transform (lambda_cog=0).
+            If False, cognitive prior is off during transform.
         method : {"legacy", "multiple_inits"}, default="multiple_inits"
-            Inference strategy for subtype/beta assignment.
+            ``legacy``: screen subtype at fixed beta (10, clipped to ``t_max``), then one
+            optimization. ``multiple_inits``: per subtype, multistart optimize from
+            ``{10,20,30}`` (clipped), pick subtype by lowest optimized ``beta_loss``.
 
         Returns
         -------
         np.ndarray
-            Structured array with dtype [('beta', 'f8'), ('subtype', 'i4')]
-            containing timeshift (beta) and subtype assignment for each patient.
+            Structured array with dtype [('beta', 'f8'), ('subtype', 'i4')].
         """
         if not hasattr(self, 'cluster_f') or not hasattr(self, 'cluster_cog_a'):
             raise RuntimeError("fit() must be called before transform()")
@@ -899,7 +828,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             )
         if len(X) == 0:
             return np.zeros(0, dtype=[('beta', 'f8'), ('subtype', 'i4')])
-        
+
         n_patients = len(X)
         n_biomarkers = X[0]["X_obs"].shape[1]
         if n_biomarkers <= 0:
@@ -910,15 +839,15 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         effective_lambda_cog = self.lambda_cog if use_cognitive_prior else 0.0
         require_cognitive_data = (effective_lambda_cog != 0.0)
         n_cog_features = int(np.ravel(self.cluster_cog_a[0]).shape[0])
-        
-        # Create structured array for results
+
         dtype = [('beta', 'f8'), ('subtype', 'i4')]
         results = np.zeros(n_patients, dtype=dtype)
+
         beta_starts = np.unique(np.clip(np.array([10.0, 20.0, 30.0], dtype=float), 0.0, self.t_max))
         if beta_starts.size == 0:
             beta_starts = np.array([0.0], dtype=float)
         legacy_beta_guess = 10.0 if self.t_max >= 10.0 else float(self.t_max)
-        
+
         for idx, p in enumerate(tqdm(X, desc="Estimating beta and subtype assignments")):
             X_obs_i = np.asarray(p["X_obs"])
             dt_i = np.asarray(p["dt"])
@@ -935,30 +864,36 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 raise ValueError(
                     f"Patient index {idx}: X_obs has {X_obs_i.shape[1]} biomarkers, expected {n_biomarkers}."
                 )
-            if X_obs_i.shape[1] == 0:
-                raise ValueError(
-                    f"Patient index {idx}: X_obs has zero biomarker columns."
-                )
 
-            if "cog" in p and p["cog"] is not None:
+            if require_cognitive_data:
+                if "cog" not in p or p["cog"] is None:
+                    raise ValueError(
+                        f"Patient index {idx}: missing 'cog', but lambda_cog={effective_lambda_cog} requires it."
+                    )
                 cog_i = ensure_2d_cog(p["cog"], len(dt_i))
                 if cog_i.shape[1] != n_cog_features:
                     raise ValueError(
                         f"Patient index {idx} has {cog_i.shape[1]} cognitive features, expected {n_cog_features}."
                     )
-                if require_cognitive_data:
-                    if not np.isfinite(cog_i).all():
-                        raise ValueError(
-                            f"Patient index {idx} has non-finite cognitive values, but lambda_cog={effective_lambda_cog} requires complete cognitive data."
-                        )
-                else:
-                    cog_i = np.nan_to_num(cog_i, nan=0.0, posinf=0.0, neginf=0.0)
-            else:
-                if require_cognitive_data:
+                if not np.isfinite(cog_i).all():
                     raise ValueError(
-                        f"Patient index {idx} is missing 'cog', but lambda_cog={effective_lambda_cog} requires cognitive data."
+                        f"Patient index {idx}: non-finite cognitive values, but lambda_cog={effective_lambda_cog}."
                     )
+            else:
+                # Prior off: do not require cog; ignore wrong-shaped cog (zeros fill training width).
                 cog_i = np.zeros((len(dt_i), n_cog_features), dtype=float)
+                if "cog" in p and p["cog"] is not None:
+                    try:
+                        tmp = ensure_2d_cog(p["cog"], len(dt_i))
+                    except ValueError:
+                        tmp = None
+                    if tmp is not None and tmp.shape[1] == n_cog_features:
+                        cog_i = np.nan_to_num(tmp, nan=0.0, posinf=0.0, neginf=0.0)
+                    elif self.verbose >= 2 and tmp is not None:
+                        print(
+                            f"Patient index {idx}: ignoring cog with shape {tmp.shape}; "
+                            f"expected (*, {n_cog_features}) when use_cognitive_prior=False."
+                        )
 
             if method == "legacy":
                 best_error = np.inf
@@ -1055,11 +990,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
                 results[idx]['beta'] = best_beta
                 results[idx]['subtype'] = best_subtype
-        
-        # Store for backward compatibility
+
         self.beta_val = results['beta']
         self.transform_assignments = results['subtype']
-        
+
         return results
 
 
