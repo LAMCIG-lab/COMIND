@@ -7,7 +7,7 @@ name = "comind"
 dynamic = ["version"]
 description = "Connectome-based Monotonic Inference of Neurodegenerative Dynamics"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 authors = [
     { name = "Daniel Semchin", email = "dsemchin@hawk.illinoistech.edu" },
 ]
