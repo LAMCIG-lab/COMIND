@@ -842,10 +842,18 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         Returns
         -------
         np.ndarray
-            Structured array with dtype [('beta', 'f8'), ('subtype', 'i4')].
+            Structured array with fields ``beta``, ``subtype``, and
+            ``beta_per_subtype`` (shape ``(n_subtypes,)`` per row): best time-shift
+            for each subtype template for that patient.
 
-        Also sets ``self.transform_subtype_probs_`` with shape ``(n_patients, n_subtypes)``
-        (same row order as ``X``), subtype probabilities from the softmax above.
+        Also sets (same data as ``beta_per_subtype`` column, for convenience):
+
+        - ``self.transform_subtype_probs_`` — shape ``(n_patients, n_subtypes)``,
+          subtype probabilities from the softmax (same row order as ``X``).
+        - ``self.transform_beta_per_subtype_`` — shape ``(n_patients, n_subtypes)``;
+          for patient ``i``, column ``k`` is the best time-shift ``beta`` when subtype
+          ``k`` is assumed (multistart for ``multiple_inits``, single start at the
+          legacy guess for ``legacy``).
         """
         if not hasattr(self, 'cluster_f') or not hasattr(self, 'cluster_cog_a'):
             raise RuntimeError("fit() must be called before transform()")
@@ -853,9 +861,17 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             raise ValueError(
                 f"Unknown transform method '{method}'. Use 'legacy' or 'multiple_inits'."
             )
+        _transform_dtype = np.dtype(
+            [
+                ("beta", np.float64),
+                ("subtype", np.int32),
+                ("beta_per_subtype", np.float64, (self.n_subtypes,)),
+            ]
+        )
         if len(X) == 0:
             self.transform_subtype_probs_ = np.zeros((0, self.n_subtypes), dtype=float)
-            return np.zeros(0, dtype=[('beta', 'f8'), ('subtype', 'i4')])
+            self.transform_beta_per_subtype_ = np.zeros((0, self.n_subtypes), dtype=float)
+            return np.zeros(0, dtype=_transform_dtype)
 
         n_patients = len(X)
         n_biomarkers = X[0]["X_obs"].shape[1]
@@ -868,9 +884,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         require_cognitive_data = (effective_lambda_cog != 0.0)
         n_cog_features = int(np.ravel(self.cluster_cog_a[0]).shape[0])
 
-        dtype = [('beta', 'f8'), ('subtype', 'i4')]
-        results = np.zeros(n_patients, dtype=dtype)
+        results = np.zeros(n_patients, dtype=_transform_dtype)
         subtype_probs = np.zeros((n_patients, self.n_subtypes), dtype=float)
+        beta_per_subtype = np.full((n_patients, self.n_subtypes), np.nan, dtype=float)
 
         beta_starts = np.unique(np.clip(np.array([10.0, 20.0, 30.0], dtype=float), 0.0, self.t_max))
         if beta_starts.size == 0:
@@ -952,6 +968,31 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     loss_per_subtype, subtype_prob_temperature
                 )
 
+                # Best beta for each subtype template (single optimization from legacy guess)
+                for subtype in range(self.n_subtypes):
+                    f_cluster = np.ravel(self.cluster_f[subtype])
+                    theta_cluster = np.concatenate([f_cluster, self.final_s, [self.final_scalar_K]])
+                    X_pred_cluster = solve_system(
+                        np.zeros(n_biomarkers), f_cluster, self.K,
+                        self.t_span, self.final_scalar_K
+                    )
+                    b_k = estimate_beta_for_patient(
+                        beta_i=float(legacy_beta_guess),
+                        X_obs_i=X_obs_i,
+                        dt_i=dt_i,
+                        X_pred=X_pred_cluster,
+                        t_span=self.t_span,
+                        cog_i=cog_i,
+                        cog_a=self.cluster_cog_a[subtype],
+                        cog_b=self.cluster_cog_b[subtype],
+                        theta=theta_cluster,
+                        K=self.K,
+                        lambda_cog=effective_lambda_cog,
+                        use_jacobian=self.jac_toggle,
+                        t_max=self.t_max,
+                    )
+                    beta_per_subtype[idx, subtype] = float(b_k)
+
                 f_assigned = np.ravel(self.cluster_f[best_subtype])
                 theta_assigned = np.concatenate([f_assigned, self.final_s, [self.final_scalar_K]])
                 X_pred_assigned = solve_system(
@@ -1020,6 +1061,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                             best_beta_subtype = float(beta_opt)
 
                     loss_per_subtype[subtype] = best_loss_subtype
+                    beta_per_subtype[idx, subtype] = best_beta_subtype
 
                     if best_loss_subtype < best_loss_global:
                         best_loss_global = best_loss_subtype
@@ -1033,9 +1075,13 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 results[idx]['beta'] = best_beta
                 results[idx]['subtype'] = best_subtype
 
+        # Expose best beta per subtype on the return value and the legacy attribute.
+        results["beta_per_subtype"] = beta_per_subtype
+
         self.beta_val = results['beta']
         self.transform_assignments = results['subtype']
         self.transform_subtype_probs_ = subtype_probs
+        self.transform_beta_per_subtype_ = beta_per_subtype
 
         return results
 
