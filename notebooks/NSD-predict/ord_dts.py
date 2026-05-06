@@ -1,32 +1,21 @@
 """
 Continuation-ratio / discrete-time survival ordinal regression for
 longitudinal panel data, with sklearn-compatible API.
-
-Contains:
-  - AdaBoostBinaryRegressor
-  - GradientBoostBinaryClassifier
-  - SVMBinaryClassifier
-  - OrdinalDiscreteTimeSurvival  (with Platt / prior calibration)
 """
 
 from __future__ import annotations
 
 import inspect
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
-from sklearn.ensemble import AdaBoostRegressor, HistGradientBoostingClassifier
+from sklearn.ensemble import AdaBoostRegressor
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.utils.validation import check_is_fitted
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Base estimator wrappers
-# ═══════════════════════════════════════════════════════════════════════════
 
 class AdaBoostBinaryRegressor(BaseEstimator):
     """
@@ -85,132 +74,6 @@ class AdaBoostBinaryRegressor(BaseEstimator):
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
 
-class GradientBoostBinaryClassifier(BaseEstimator):
-    """
-    HistGradientBoostingClassifier wrapped to match the
-    AdaBoostBinaryRegressor interface used by OrdinalDiscreteTimeSurvival.
-
-    Each threshold k in the continuation-ratio model gets its own clone
-    of this estimator, fitted on the at-risk subset for that threshold.
-
-    Parameters
-    ----------
-    max_iter : int
-        Number of boosting rounds (equivalent to n_estimators).
-    learning_rate : float
-        Shrinkage applied to each tree.
-    max_leaf_nodes : int
-        Max leaves per tree. Controls complexity.
-        31 ≈ depth-5, 15 ≈ depth-4, 7 ≈ depth-3.
-    l2_regularization : float
-        L2 penalty on leaf values. Helps with imbalanced/small at-risk sets.
-    early_stopping : bool
-        If True, uses internal validation fraction to stop early.
-    random_state : int or None
-    """
-
-    def __init__(
-        self,
-        max_iter: int = 100,
-        learning_rate: float = 0.1,
-        max_leaf_nodes: int = 31,
-        l2_regularization: float = 0.0,
-        early_stopping: bool = False,
-        random_state=None,
-    ):
-        self.max_iter = max_iter
-        self.learning_rate = learning_rate
-        self.max_leaf_nodes = max_leaf_nodes
-        self.l2_regularization = l2_regularization
-        self.early_stopping = early_stopping
-        self.random_state = random_state
-
-    def fit(self, X, y, sample_weight=None):
-        y = np.asarray(y).astype(float)
-        unique = np.unique(y)
-        if not set(unique.tolist()).issubset({0.0, 1.0}):
-            raise ValueError(
-                f"GradientBoostBinaryClassifier expects binary {{0,1}} targets; "
-                f"got {unique}"
-            )
-        self.clf_ = HistGradientBoostingClassifier(
-            max_iter=self.max_iter,
-            learning_rate=self.learning_rate,
-            max_leaf_nodes=self.max_leaf_nodes,
-            l2_regularization=self.l2_regularization,
-            early_stopping=self.early_stopping,
-            random_state=self.random_state,
-            class_weight=None,  # handled via sample_weight
-        )
-        self.clf_.fit(X, y.astype(int), sample_weight=sample_weight)
-        self.classes_ = np.array([0, 1])
-        return self
-
-    def predict_proba(self, X):
-        check_is_fitted(self, "clf_")
-        return self.clf_.predict_proba(X)
-
-    def predict(self, X):
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
-
-class SVMBinaryClassifier(BaseEstimator):
-    """
-    SVC wrapped to match the AdaBoostBinaryRegressor interface.
-    Uses hinge loss (SVM margin) natively.
-
-    Uses decision_function scores converted to pseudo-probabilities via
-    sigmoid — OrdinalDiscreteTimeSurvival's Platt calibration then
-    calibrates these properly. This avoids the double-calibration problem
-    of SVC(probability=True) which runs its own internal 5-fold CV.
-
-    Parameters
-    ----------
-    C : float
-        SVM regularization — smaller = stronger regularization.
-    kernel : str
-        'rbf' (nonlinear) or 'linear'. Use 'linear' for small at-risk sets.
-    gamma : str or float
-        Kernel coefficient for 'rbf'. Default 'scale'.
-    random_state : int or None
-    """
-
-    def __init__(self, C=1.0, kernel="rbf", gamma="scale", random_state=None):
-        self.C = C
-        self.kernel = kernel
-        self.gamma = gamma
-        self.random_state = random_state
-
-    def fit(self, X, y, sample_weight=None):
-        self.clf_ = SVC(
-            C=self.C,
-            kernel=self.kernel,
-            gamma=self.gamma,
-            probability=False,     # OrdinalDiscreteTimeSurvival handles calibration
-            random_state=self.random_state,
-            class_weight=None,     # handled via sample_weight
-        )
-        self.clf_.fit(X, y.astype(int), sample_weight=sample_weight)
-        self.classes_ = np.array([0, 1])
-        return self
-
-    def predict_proba(self, X):
-        check_is_fitted(self, "clf_")
-        # Convert decision function scores to pseudo-probabilities via sigmoid.
-        # Platt calibration in OrdinalDiscreteTimeSurvival calibrates these.
-        scores = self.clf_.decision_function(X)
-        p1 = 1.0 / (1.0 + np.exp(-scores))
-        p1 = np.clip(p1, 1e-6, 1.0 - 1e-6)
-        return np.column_stack([1.0 - p1, p1])
-
-    def predict(self, X):
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# OrdinalDiscreteTimeSurvival
-# ═══════════════════════════════════════════════════════════════════════════
-
 class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
     """
     Continuation-ratio / discrete-time survival ordinal classifier for
@@ -240,62 +103,94 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
     order : array-like, optional
         Expected ordered class values, lowest to highest. REQUIRED if y
         is non-numeric. If y is numeric and `order` is None, classes are
-        taken as np.unique(y) sorted ascending.
+        taken as np.unique(y) sorted ascending. Raises if y contains any
+        value not in `order`.
 
     base_estimator : sklearn classifier, optional
         Binary classifier with `predict_proba`. One clone is fitted per
-        threshold. Default: AdaBoostBinaryRegressor.
+        threshold. Default: AdaBoostBinaryRegressor (AdaBoost.R2 with
+        square loss, wrapped to expose predict_proba).
 
     subj_id_col, time_col : str
         Names of the subject-id and within-subject relative-time columns
-        in X. Time values are used only to ORDER visits within a subject.
+        in X. Time values are used only to ORDER visits within a subject;
+        their numeric values are not used as covariates.
 
     include_visit_index : bool, default=True
-        Include the within-subject visit number (1, 2, ...) as a feature.
+        Include the within-subject visit number (1, 2, ...) as a feature
+        of each hazard model — represents the discrete-time baseline
+        hazard.
 
     class_weight : {'balanced', None}, default='balanced'
         If 'balanced', applies inverse-frequency sample weights to each
-        threshold's binary problem.
+        threshold's binary problem (computed within that threshold's
+        at-risk set).
 
     enforce_threshold_ordering : bool, default=True
         At prediction time, enforce P(Y >= c_{k+1}) >= P(Y >= c_{k+2})
         by post-hoc cumulative max from the highest threshold downward.
+        Without this, threshold-specific (non-PO) hazards may produce
+        internally inconsistent stage probabilities.
 
     calibration_method : {'platt', 'prior', None}, default='platt'
         Per-threshold probability calibration applied at predict time.
 
-        - 'platt': Held-out Platt scaling. A fraction of subjects
-          (`calibration_fraction`) is held out from base-model fitting;
-          raw predictions on that set are mapped to calibrated probabilities
-          via sigmoid(a * logit(p_raw) + b) fit per threshold. Works for
-          any base estimator and absorbs the balanced-weighting bias.
+        - 'platt': Held-out Platt scaling. At fit time, a fraction of
+          subjects (`calibration_fraction`) is held out from base-model
+          fitting; the base predictions on that held-out set are mapped
+          to calibrated probabilities via a 1-D logistic regression
+              P(y=1 | p_raw) = sigmoid(a * logit(p_raw) + b)
+          fit per threshold. Works for any base estimator and absorbs the
+          intercept shift from class_weight='balanced' automatically.
 
-        - 'prior': Closed-form intercept correction for balanced weighting
-          bias. EXACT for LogisticRegression, APPROXIMATE for nonlinear
-          estimators.
+        - 'prior': Closed-form intercept correction for the bias from
+          class_weight='balanced'. Stores per-threshold crossing rate
+          pi_k on the at-risk training set; at predict time subtracts
+          log((1 - pi_k) / pi_k) from the predicted hazard logit. EXACT
+          for LogisticRegression, APPROXIMATE for nonlinear estimators.
 
-        - None: no calibration; raw probabilities used as-is.
+        - None: no calibration; raw base-estimator probabilities are
+          used. Predictions will be biased upward when class_weight
+          ='balanced' was used at fit time.
 
     calibration_fraction : float, default=0.25
         Fraction of training subjects held out for Platt calibration.
-        Subject-level split to avoid within-subject leakage.
+        Ignored unless calibration_method='platt'. Subject-level split
+        (not row-level) to avoid leakage of within-subject correlation.
 
     calibration_random_state : int or None, default=None
-        Seed for the subject-level calibration split.
+        Seed for the subject-level calibration split. Set for
+        reproducibility.
 
     Attributes
     ----------
     classes_ : np.ndarray, shape (K,)
+        Ordered class labels (output order of `predict_proba`).
     threshold_models_ : dict[int, estimator or tuple]
-    platt_models_ : dict[int, tuple or None]
+        Fitted estimator for threshold k, or a ('constant', value) pair
+        if the at-risk set was degenerate (single class or empty).
+    platt_models_ : dict[int, LogisticRegression or None]
+        Per-threshold Platt-scaling logistic regressions; None if a
+        threshold's calibration set was too sparse (single-class, empty,
+        or fewer than 10 at-risk rows).
     priors_ : dict[int, float]
+        Per-threshold event rate pi_k on the at-risk training set, used
+        for 'prior' calibration and as a fallback when Platt cannot be fit.
     feature_names_ : list[str]
+        Feature columns used by the hazard models, in order.
     K_ : int
+        Number of classes.
 
     Notes
     -----
     Population-averaged model — does not estimate subject random effects.
     Cross-validate by SUBJECT (not by row) to avoid leakage.
+
+    Per-visit reversals (Y going down then up due to noise) are handled
+    by training on the FIRST-CROSSING time per (subject, threshold). Strict
+    within-subject monotonicity is not required of the input, but the
+    discrete-time survival interpretation assumes the underlying process
+    is approximately monotone.
     """
 
     def __init__(
@@ -322,7 +217,7 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
         self.calibration_fraction = calibration_fraction
         self.calibration_random_state = calibration_random_state
 
-    # ── internal helpers ───────────────────────────────────────────────────
+    # ---------------- internal helpers ----------------
 
     def _validate_classes(self, y: np.ndarray) -> np.ndarray:
         observed = pd.unique(y)
@@ -333,6 +228,7 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
                     "non-numeric targets require an explicit `order=` argument."
                 )
             return np.sort(observed)
+
         order_arr = np.asarray(self.order)
         if len(set(order_arr.tolist())) != len(order_arr):
             raise ValueError("`order` contains duplicate values.")
@@ -365,11 +261,14 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
 
     @staticmethod
     def _within_subject_visit_index(subj_sorted: np.ndarray) -> np.ndarray:
+        """1-indexed visit number within each subject, assuming input is
+        already sorted by (subject, time)."""
         s = pd.Series(subj_sorted)
         return s.groupby(s, sort=False).cumcount().to_numpy() + 1
 
     @staticmethod
     def _sort_by_subject_time(subj: np.ndarray, time: np.ndarray) -> np.ndarray:
+        # Stable sort: primary key subject, secondary key time.
         df = pd.DataFrame({"_s": subj, "_t": time})
         return df.sort_values(["_s", "_t"], kind="mergesort").index.to_numpy()
 
@@ -380,7 +279,13 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
 
     @staticmethod
     def _fit_platt(p_raw: np.ndarray, y: np.ndarray, min_n: int = 10):
-        """Fit sigmoid(a * logit(p_raw) + b). Returns (a, b) or None."""
+        """Fit 1-D Platt scaling sigmoid(a * logit(p_raw) + b).
+
+        Returns (a, b) or None if calibration set is too sparse / degenerate.
+        Uses essentially unregularized logistic regression on the logit.
+        Class balance inside Platt is left at NATURAL frequencies — Platt's
+        job is to recover marginal calibration.
+        """
         if len(y) < min_n or len(np.unique(y)) < 2:
             return None
         z = OrdinalDiscreteTimeSurvival._logit(p_raw).reshape(-1, 1)
@@ -394,12 +299,13 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
         z = OrdinalDiscreteTimeSurvival._logit(p_raw)
         return 1.0 / (1.0 + np.exp(-(a * z + b)))
 
-    # ── fit ───────────────────────────────────────────────────────────────
+    # ---------------- fit ----------------
 
     def fit(self, X: pd.DataFrame, y):
+        # Validate calibration_method
         if self.calibration_method not in (None, "platt", "prior"):
             raise ValueError(
-                f"calibration_method must be None, 'platt', or 'prior'; "
+                f"calibration_method must be one of None, 'platt', 'prior'; "
                 f"got {self.calibration_method!r}."
             )
         if self.calibration_method == "platt" and not (
@@ -420,6 +326,7 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
         feats, subj, time, y_arr = self._split_panel(X, y)
         y_rank = np.array([rank_map[v] for v in y_arr], dtype=int)
 
+        # Sort everything by (subject, time)
         order_idx = self._sort_by_subject_time(subj, time)
         feats_s = feats.iloc[order_idx].reset_index(drop=True)
         subj_s = subj[order_idx]
@@ -430,7 +337,7 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
             feats_s["__visit_index__"] = self._within_subject_visit_index(subj_s)
         self.feature_names_ = list(feats_s.columns)
 
-        # ── subject-level split for Platt calibration ──────────────────────
+        # ---- subject-level split for Platt calibration ----
         unique_subj = pd.unique(subj_s)
         if self.calibration_method == "platt":
             rng = np.random.default_rng(self.calibration_random_state)
@@ -463,13 +370,13 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
         Xv = feats_s.to_numpy()
         self.threshold_models_ = {}
         self.platt_models_ = {}
-        self.priors_ = {}
+        self.priors_ = {}  # per-threshold event rate, used by 'prior' method / fallback
 
         for k in range(self.K_ - 1):
             crossed = (y_rank_s > k).astype(int)
             cs = pd.Series(crossed).groupby(df_subj, sort=False).cumsum().to_numpy()
             cs_before = cs - crossed
-            at_risk = cs_before == 0
+            at_risk = cs_before == 0  # not yet crossed coming into this visit
 
             if not at_risk.any():
                 self.threshold_models_[k] = ("constant", 0.0)
@@ -477,46 +384,60 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
                 self.priors_[k] = 0.0
                 continue
 
+            # split at-risk rows by base-fit / calibration subject membership
             base_mask = at_risk & is_base_fit
-            cal_mask  = at_risk & is_cal
+            cal_mask = at_risk & is_cal
             X_k = Xv[base_mask]
             y_k = crossed[base_mask]
 
+            # Prior is computed on the BASE-FIT at-risk set (the set the base
+            # model was actually trained on); this matches the data-generating
+            # premise for the King–Zeng correction.
             self.priors_[k] = float(y_k.mean()) if len(y_k) > 0 else 0.0
 
             if len(y_k) == 0 or len(np.unique(y_k)) < 2:
+                # Degenerate base-fit set for this threshold.
                 const = float(y_k.mean()) if len(y_k) > 0 else 0.0
                 self.threshold_models_[k] = ("constant", const)
                 self.platt_models_[k] = None
                 continue
 
-            sw = (
-                compute_sample_weight("balanced", y_k)
-                if self.class_weight == "balanced"
-                else None
-            )
-            if sw is not None and not supports_sw:
+            if self.class_weight == "balanced":
+                sw = compute_sample_weight("balanced", y_k)
+            elif self.class_weight is None:
+                sw = None
+            else:
+                raise ValueError(
+                    f"class_weight must be 'balanced' or None; got {self.class_weight!r}."
+                )
+
+            est = clone(base)
+            if supports_sw:
+                est.fit(X_k, y_k, sample_weight=sw)
+            elif sw is not None:
                 raise ValueError(
                     f"base_estimator {type(base).__name__} does not support "
                     "sample_weight; pass class_weight=None or use a different estimator."
                 )
-
-            est = clone(base)
-            est.fit(X_k, y_k, sample_weight=sw) if supports_sw else est.fit(X_k, y_k)
+            else:
+                est.fit(X_k, y_k)
             self.threshold_models_[k] = est
 
-            # ── Platt fit on held-out calibration rows ─────────────────────
+            # ---- Platt fit on held-out at-risk calibration rows ----
             if self.calibration_method == "platt" and cal_mask.any():
-                p_raw = est.predict_proba(Xv[cal_mask])[:, 1]
-                self.platt_models_[k] = self._fit_platt(p_raw, crossed[cal_mask])
+                X_cal_k = Xv[cal_mask]
+                y_cal_k = crossed[cal_mask]
+                p_raw = est.predict_proba(X_cal_k)[:, 1]
+                self.platt_models_[k] = self._fit_platt(p_raw, y_cal_k)
             else:
                 self.platt_models_[k] = None
 
         return self
 
-    # ── predict ───────────────────────────────────────────────────────────
+    # ---------------- predict ----------------
 
     def _cumulative_crossing_probs(self, X: pd.DataFrame) -> np.ndarray:
+        """Per-row F_k(visit) = P(Y_{ij} >= c_{k+1} | x_{i,1:j}) for k=0..K-2."""
         check_is_fitted(self)
         feats, subj, time = self._split_panel(X)
         order_idx = self._sort_by_subject_time(subj, time)
@@ -532,10 +453,11 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
             raise ValueError(f"Features missing in X: {missing}")
         feats_s = feats_s[self.feature_names_]
 
+        n = len(feats_s)
         Km1 = self.K_ - 1
-        Xv  = feats_s.to_numpy()
-        hazards = np.zeros((len(feats_s), Km1))
+        Xv = feats_s.to_numpy()
 
+        hazards = np.zeros((n, Km1))
         for k in range(Km1):
             m = self.threshold_models_[k]
             if isinstance(m, tuple) and m[0] == "constant":
@@ -548,24 +470,31 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
                 ab = self.platt_models_.get(k)
                 if ab is not None:
                     h = self._apply_platt(h, ab)
-                elif self.class_weight == "balanced":
-                    # Fallback to prior correction if Platt couldn't be fit
-                    pi = self.priors_.get(k, 0.5)
-                    if 0.0 < pi < 1.0:
-                        h = 1.0 / (1.0 + np.exp(
-                            -(self._logit(h) + np.log(pi / (1.0 - pi)))))
-
+                else:
+                    # Fallback: prior correction if balanced was used, else raw.
+                    if self.class_weight == "balanced":
+                        pi = self.priors_.get(k, 0.5)
+                        if 0.0 < pi < 1.0:
+                            h = 1.0 / (
+                                1.0 + np.exp(
+                                    -(self._logit(h) + np.log(pi / (1.0 - pi)))
+                                )
+                            )
             elif self.calibration_method == "prior":
                 if self.class_weight == "balanced":
                     pi = self.priors_.get(k, 0.5)
                     if 0.0 < pi < 1.0:
-                        h = 1.0 / (1.0 + np.exp(
-                            -(self._logit(h) + np.log(pi / (1.0 - pi)))))
-
-            # calibration_method is None → use raw h
+                        h = 1.0 / (
+                            1.0 + np.exp(
+                                -(self._logit(h) + np.log(pi / (1.0 - pi)))
+                            )
+                        )
+            # else: calibration_method is None; use raw h.
 
             hazards[:, k] = h
 
+        # Cumulative threshold-crossing prob within subject:
+        # F_k(j) = 1 - prod_{j'<=j} (1 - h_k(j')); compute via cumsum of log(1-h).
         log_surv = np.log(np.clip(1.0 - hazards, 1e-12, 1.0))
         cum = (
             pd.DataFrame(log_surv)
@@ -575,19 +504,24 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
         )
         F = 1.0 - np.exp(cum)
 
+        # Enforce P(Y >= c_{k+1}) >= P(Y >= c_{k+2}) (consistency across thresholds)
         if self.enforce_threshold_ordering and Km1 >= 2:
             for k in range(Km1 - 2, -1, -1):
                 F[:, k] = np.maximum(F[:, k], F[:, k + 1])
 
+        # Restore original input row order
         unsort = np.argsort(order_idx)
         return F[unsort]
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """
-        Returns array of shape (n_rows, K) with per-class probabilities
-        in `self.classes_` order.
+        P(Y_{i,j} = c_m | history up to visit j) for each row of X.
+
+        Returns array of shape (n_rows, K) with columns in `self.classes_` order.
+        Within-subject sequences are monotone in the cumulative sense
+        (F_k(j) non-decreasing in j) by construction.
         """
-        F = self._cumulative_crossing_probs(X)
+        F = self._cumulative_crossing_probs(X)  # (n, K-1); F[:, k] = P(Y >= c_{k+1})
         n, Km1 = F.shape
         K = Km1 + 1
         proba = np.empty((n, K))
@@ -595,12 +529,13 @@ class OrdinalDiscreteTimeSurvival(ClassifierMixin, BaseEstimator):
         for m in range(1, K - 1):
             proba[:, m] = F[:, m - 1] - F[:, m]
         proba[:, K - 1] = F[:, K - 2]
+        # Numerical safety
         proba = np.clip(proba, 0.0, None)
         s = proba.sum(axis=1, keepdims=True)
         s[s == 0] = 1.0
         return proba / s
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Modal stage prediction per row."""
+        """Modal stage prediction per row (label drawn from `self.classes_`)."""
         idx = np.argmax(self.predict_proba(X), axis=1)
         return np.asarray(self.classes_)[idx]
