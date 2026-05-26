@@ -1,0 +1,16 @@
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*.cpython-*.pyc
+
+# Ignore experiment results
+*.npz
+experiments/path/to/sensitive.csv
+/home/dsemchin/COMIND/notebooks/data_ppmi_pd_with_best_model_subject_cols_with_subtype_probas.csv
+experiments/*/logs/
+**/*.o[0-9]*

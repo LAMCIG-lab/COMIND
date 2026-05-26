@@ -1,0 +1,20 @@
+#!/bin/bash
+#PBS -N ppmi_subtyping_bic
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=24:00:00
+#PBS -l mem=8gb
+#PBS -j oe
+#PBS -o /home/dsemchin/COMIND/experiments/2026_04_21_PPMI_kappa_2/logs
+#PBS -m abe
+# Grid matches run_ppmi_subtyping_gridsearch.py in EXP_DIR: 3 n_subtypes × 144 hyper combos = 243 tasks (indices 0–242).
+# Use up to 100 concurrent tasks to spread load across 10×28-core nodes without oversubscribing.
+# Increase or decrease the % value based on your queue policies (e.g. 0-242%50).
+#PBS -t 0-143
+
+cd $PBS_O_WORKDIR
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate comind
+EXP_DIR="/home/dsemchin/COMIND/experiments/2026_04_21_PPMI_kappa_2"
+mkdir -p "$EXP_DIR/logs"
+mkdir -p "$EXP_DIR/results"
+python "$EXP_DIR/run_ppmi_subtyping_gridsearch.py" --candidate $PBS_ARRAYID
