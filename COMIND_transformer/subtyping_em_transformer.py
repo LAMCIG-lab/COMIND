@@ -29,9 +29,14 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     best LSE so far, EM exits early and restores parameters to the start of that outer
     iteration (so ``final_*`` match the last improving state).
 
-    Global kappa is initialized with ``Uniform(0, 1)`` per biomarker. ``kappa_history``
-    stores kappa after the initial setup (column 0) and after each accepted outer
-    iteration, aligned with ``beta_history`` / ``lse_history`` indexing.
+    Global kappa is initialized with ``Uniform(0, 1)`` per biomarker unless
+    ``initial_kappa`` is set. ``kappa_history`` stores kappa after the initial setup
+    (column 0) and after each accepted outer iteration, aligned with ``beta_history`` /
+    ``lse_history`` indexing.
+
+    Warm-start: pass ``initial_f`` (``n_subtypes`` × ``n_biomarkers``), ``initial_s``,
+    ``initial_scalar_K``, ``initial_kappa``, ``initial_assignments``, per-subtype cognitive
+    params, and ``initial_beta``, or use :func:`COMIND_transformer.warm_start.load_warm_start_from_npz`.
     """
 
     def __init__(self, 
@@ -51,10 +56,14 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 lambda_kappa: float = 0.0,
                  
                  # [initial guesses]
-                 initial_f: np.ndarray = None, 
+                 initial_f: np.ndarray = None,
+                 initial_s: np.ndarray = None,
+                 initial_scalar_K: float = None,
+                 initial_kappa: np.ndarray = None,
                  initial_assignments: np.ndarray = None,
-                 # initial_s
-                 # initial_s_K
+                 initial_cluster_cog_a: np.ndarray = None,
+                 initial_cluster_cog_b: np.ndarray = None,
+                 initial_beta: np.ndarray = None,
                  
                  # [iterative fitting parameters]
                  jac_toggle: bool = False,
@@ -92,7 +101,13 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         
         # [initial guesses]
         self.initial_f = initial_f
+        self.initial_s = initial_s
+        self.initial_scalar_K = initial_scalar_K
+        self.initial_kappa = initial_kappa
         self.initial_assignments = initial_assignments
+        self.initial_cluster_cog_a = initial_cluster_cog_a
+        self.initial_cluster_cog_b = initial_cluster_cog_b
+        self.initial_beta = initial_beta
         
         # [fitting params]
         self.jac_toggle = jac_toggle
@@ -151,7 +166,17 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
         # print(X_obs.shape, dt.shape, cog.shape, ids.shape)
 
-        if initial_beta_list:
+        if self.initial_beta is not None:
+            initial_beta = np.asarray(self.initial_beta, dtype=float).copy()
+            if initial_beta.shape != (n_patients,):
+                raise ValueError(
+                    f"initial_beta must have shape ({n_patients},), got {initial_beta.shape}"
+                )
+        elif initial_beta_list:
+            if len(initial_beta_list) != n_patients:
+                raise ValueError(
+                    f"initial_beta on patients: expected {n_patients} values, got {len(initial_beta_list)}"
+                )
             initial_beta = np.array(initial_beta_list)
         else:
             initial_beta = initialize_beta(ids=np.arange(n_patients), beta_range=(0, self.t_max), rng=self.rng)
@@ -195,72 +220,36 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 initial_f = np.ravel(init_f)
         else:
             initial_f = rng.uniform(0, 0.1, size=n_biomarkers)
-            
-        initial_s = rng.uniform(0.1, 3, size=n_biomarkers)
-        # initial_scalar_K = float(rng.uniform(0.01, 3, size=1))
-        initial_scalar_K = float(np.max(X_obs))
-        
-        initial_theta = np.concatenate([initial_f, initial_s, [initial_scalar_K]])
-        
-        # Initialize current scalar_K (global, not per-cluster)
+
+        if self.initial_s is not None:
+            initial_s = np.asarray(self.initial_s, dtype=float).ravel().copy()
+            if initial_s.shape != (n_biomarkers,):
+                raise ValueError(f"initial_s must have shape ({n_biomarkers},), got {initial_s.shape}")
+        else:
+            initial_s = rng.uniform(0.1, 3, size=n_biomarkers)
+
+        if self.initial_scalar_K is not None:
+            initial_scalar_K = float(self.initial_scalar_K)
+        else:
+            initial_scalar_K = float(np.max(X_obs))
+
+        if self.initial_kappa is not None:
+            current_kappa = np.asarray(self.initial_kappa, dtype=float).ravel().copy()
+            if current_kappa.shape != (n_biomarkers,):
+                raise ValueError(
+                    f"initial_kappa must have shape ({n_biomarkers},), got {current_kappa.shape}"
+                )
+        else:
+            current_kappa = rng.uniform(0.0, 1.0, size=n_biomarkers)
+
         current_scalar_K = initial_scalar_K
 
-        current_kappa = rng.uniform(0.0, 1.0, size=n_biomarkers)
-        
-        # cog regression params - per subtype
-        initial_cog_a = np.ones(n_cog_features) # initialize a weight for each type of cog test
-        initial_cog_b = 0 # bias term
-                
-        ## initialize histories
-        theta_history = np.zeros((initial_theta.shape[0], self.max_iter + 1)) # extra column added for initial guesses
-        beta_history = np.zeros((n_patients, self.max_iter + 1))
-        kappa_history = np.zeros((n_biomarkers, self.max_iter + 1))
-        lse_history = np.zeros(self.max_iter + 1)
-        cog_regression_history = np.zeros((self.n_subtypes, n_cog_features + 1, self.max_iter + 1))  # per subtype
-        
-        ## Append initial values to histories
-        theta_history[:, 0] = initial_theta
-        beta_history[:, 0] = initial_beta
-        kappa_history[:, 0] = current_kappa
-        for subtype in range(self.n_subtypes):
-            cog_regression_history[subtype, :, 0] = np.concatenate([initial_cog_a, [initial_cog_b]])
-        
-        ## Compute Initial LSE (pure reconstruction error, no regularization)
-        X_pred = solve_system(
-            initial_x0, initial_f, K, self.t_span, current_scalar_K, current_kappa
-        )
-        initial_lse = 0.0
-        
-        for idx, pid in enumerate(np.unique(ids)): # each iter will be like (idx, pid)
-            mask = (ids == pid)
-            X_obs_i = X_obs[mask,:]
-            dt_i = dt[mask]
-            beta_i = initial_beta[idx]
-            
-            # Compute pure reconstruction error (no regularization)
-            t_pred_i = dt_i + beta_i
-            
-            X_interp_i = np.array([
-                np.interp(t_pred_i, self.t_span, initial_s[b] * X_pred[b])
-                for b in range(n_biomarkers)
-            ])
-            
-            X_obs_i_T = X_obs_i.T  # (n_biomarkers, n_obs_i)
-            residuals = X_obs_i_T - X_interp_i
-            initial_lse += np.sum(residuals ** 2)
-            
-        lse_history[0] = initial_lse
-        
-        # initialize current vars for main loop
-        current_beta = initial_beta
-        current_s = initial_s
-        current_scalar_K = initial_scalar_K
-        
-        # Initialize cluster-level parameters
-        # Each cluster has its own f and cognitive regression params (scalar_K is now global)
+        # Initialize cluster-level parameters (f and cognitive regression per subtype)
         cluster_f = []
         cluster_cog_a = []
         cluster_cog_b = []
+        default_cog_a = np.ones(n_cog_features)
+        default_cog_b = 0.0
         for subtype in range(self.n_subtypes):
             if self.initial_f is not None:
                 init_f = np.asarray(self.initial_f)
@@ -271,10 +260,26 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     cluster_f.append(initial_f_flat.copy() + rng.uniform(-0.01, 0.01, size=n_biomarkers))
             else:
                 cluster_f.append(rng.uniform(0, 0.1, size=n_biomarkers))
-            cluster_cog_a.append(initial_cog_a.copy())
-            cluster_cog_b.append(initial_cog_b)
-        
-        # Initialize cluster assignments (use provided, from patient dicts, or random)
+
+            if self.initial_cluster_cog_a is not None:
+                cog_a_src = np.asarray(self.initial_cluster_cog_a, dtype=float)
+                if cog_a_src.ndim == 1:
+                    cluster_cog_a.append(cog_a_src.copy())
+                else:
+                    cluster_cog_a.append(np.ravel(cog_a_src[subtype]).copy())
+            else:
+                cluster_cog_a.append(default_cog_a.copy())
+
+            if self.initial_cluster_cog_b is not None:
+                cog_b_src = np.asarray(self.initial_cluster_cog_b, dtype=float).ravel()
+                if cog_b_src.size == 1:
+                    cluster_cog_b.append(float(cog_b_src[0]))
+                else:
+                    cluster_cog_b.append(float(cog_b_src[subtype]))
+            else:
+                cluster_cog_b.append(default_cog_b)
+
+        # Cluster assignments (warm-start, patient dict, or random)
         if self.initial_assignments is not None:
             if len(self.initial_assignments) != n_patients:
                 raise ValueError(
@@ -287,7 +292,6 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 )
             assignments = self.initial_assignments.copy()
         elif all("initial_subtype" in p for p in X):
-            # Read initial_subtype from patient dictionaries
             assignments = np.array([p["initial_subtype"] for p in X], dtype=int)
             if np.any(assignments < 0) or np.any(assignments >= self.n_subtypes):
                 raise ValueError(
@@ -295,8 +299,54 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 )
         else:
             assignments = rng.integers(0, self.n_subtypes, size=n_patients)
-        
-        # Store assignment history
+
+        representative_theta = np.concatenate(
+            [np.ravel(cluster_f[0]), initial_s, [initial_scalar_K]]
+        )
+
+        ## initialize histories
+        theta_history = np.zeros((representative_theta.shape[0], self.max_iter + 1))
+        beta_history = np.zeros((n_patients, self.max_iter + 1))
+        kappa_history = np.zeros((n_biomarkers, self.max_iter + 1))
+        lse_history = np.zeros(self.max_iter + 1)
+        cog_regression_history = np.zeros((self.n_subtypes, n_cog_features + 1, self.max_iter + 1))
+
+        theta_history[:, 0] = representative_theta
+        beta_history[:, 0] = initial_beta
+        kappa_history[:, 0] = current_kappa
+        for subtype in range(self.n_subtypes):
+            cog_regression_history[subtype, :, 0] = np.concatenate(
+                [cluster_cog_a[subtype], [cluster_cog_b[subtype]]]
+            )
+
+        ## Initial LSE (subtype-specific trajectories when assignments differ)
+        X_pred_by_cluster_init = []
+        for subtype in range(self.n_subtypes):
+            f_cluster = np.ravel(cluster_f[subtype])
+            X_pred_by_cluster_init.append(
+                solve_system(initial_x0, f_cluster, K, self.t_span, current_scalar_K, current_kappa)
+            )
+        initial_lse = 0.0
+        for idx, pid in enumerate(np.unique(ids)):
+            mask = (ids == pid)
+            X_obs_i = X_obs[mask, :]
+            dt_i = dt[mask]
+            beta_i = initial_beta[idx]
+            subtype = assignments[idx]
+            X_pred = X_pred_by_cluster_init[subtype]
+            t_pred_i = dt_i + beta_i
+            X_interp_i = np.array([
+                np.interp(t_pred_i, self.t_span, initial_s[b] * X_pred[b])
+                for b in range(n_biomarkers)
+            ])
+            residuals = X_obs_i.T - X_interp_i
+            initial_lse += np.sum(residuals ** 2)
+
+        lse_history[0] = initial_lse
+
+        current_beta = initial_beta
+        current_s = initial_s
+
         assignment_history = np.zeros((n_patients, self.max_iter + 1), dtype=int)
         assignment_history[:, 0] = assignments
         

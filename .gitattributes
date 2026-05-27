@@ -1,0 +1,3 @@
+# Force Unix line endings for cluster scripts (avoids qsub CRLF errors)
+*.pbs text eol=lf
+*.sh text eol=lf
