@@ -177,8 +177,8 @@ def estimate_beta(
         Kx_plus_f = K_eff @ x_k + f_cluster[:, None]
         dxdt_by_cluster[subtype] = (1.0 - x_k) * Kx_plus_f
 
-    def loss_func(beta_vec):
-        loss, _ = _vectorized_beta_loss_and_grad(
+    def loss_and_grad(beta_vec):
+        return _vectorized_beta_loss_and_grad(
             beta_vec,
             X_obs,
             dt,
@@ -204,42 +204,12 @@ def estimate_beta(
             beta_mean,
             beta_var,
         )
-        return loss
-
-    def grad_func(beta_vec):
-        _, grad = _vectorized_beta_loss_and_grad(
-            beta_vec,
-            X_obs,
-            dt,
-            ids,
-            cog,
-            t_span,
-            cluster_f,
-            scalar_K,
-            s,
-            assignments,
-            K,
-            cluster_cog_a,
-            cluster_cog_b,
-            lambda_cog,
-            lambda_jsd,
-            t_max,
-            X_pred_by_cluster,
-            dxdt_by_cluster,
-            jsd_n_bins,
-            jsd_bandwidth,
-            jsd_value_range,
-            lambda_beta,
-            beta_mean,
-            beta_var,
-        )
-        return grad
 
     result = minimize(
-        loss_func,
+        loss_and_grad,
         x0=beta_all.copy(),
         method="L-BFGS-B",
-        jac=grad_func,
+        jac=True,
         bounds=[(0, t_max)] * n_patients,
         options={"maxiter": 100},
     )

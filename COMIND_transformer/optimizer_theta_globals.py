@@ -7,7 +7,7 @@ from .sensitivity_lsoda import (
 )
 
 # Log-normal prior center for scalar_K (penalty pulls toward this value)
-SCALAR_K_CENTER = 0.1
+SCALAR_K_CENTER = 0.25
 # Lower bound for scalar_K in log-normal penalty/gradient to avoid log(0) and divide-by-zero
 SCALAR_K_MIN = 1e-12
 SPARSE_PSEUDO_HUBER_DELTA = 0.05
