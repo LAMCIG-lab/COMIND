@@ -8,6 +8,7 @@ from .optimizer_theta_cluster import fit_theta_cluster
 from .optimizer_beta import estimate_beta, reconstruction_sse
 from .optimizer_cognitive_regression import fit_linear_cog_regression_multi
 from .kernel_jsd_multi import KernelJSDMulti
+from .model_selection import count_bic_params, compute_bic
 from .utils import *
 
 class SubtypingEM(BaseEstimator, TransformerMixin):
@@ -650,7 +651,20 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             cluster_f, current_s, current_scalar_K, current_kappa
         )
         # BIC on training data (lower is better)
-        self.bic_ = self.bic(X=None)
+        k = count_bic_params(
+            self.final_s,
+            self.final_kappa,
+            self.cluster_f,
+            self.n_subtypes,
+            self.lambda_cog,
+            cluster_cog_a=self.cluster_cog_a,
+        )
+        self.bic_ = compute_bic(
+            self._sse_per_biomarker,
+            self._var_per_biomarker_null,
+            self.n_obs_,
+            k,
+        )
 
         return self
     
@@ -1085,225 +1099,3 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             ])
             sse_per_b += (X_obs[r] - pred_r) ** 2
         return sse_per_b
-
-    def _bic_n_params(self) -> int:
-        """
-        Number of free parameters for BIC (population only; no subject-level beta).
-        K = n_biomarkers (s) + #(active kappa) + 1 (time scale)
-            + (n_cog * n_subtypes + n_subtypes if lambda_cog > 0)
-            + sum over subtypes of #(active f_i).
-        Small-magnitude parameters are treated as effectively zero for counting.
-        """
-        if not hasattr(self, "final_s") or not hasattr(self, "cluster_f") or not hasattr(self, "final_kappa"):
-            raise RuntimeError("fit() must be called before _bic_n_params()")
-
-        n_biomarkers = self.final_s.shape[0]
-        n_subtypes = self.n_subtypes
-
-        # Global: s (n_biomarkers), kappa (counted per-active entry), time scale (1)
-        param_active_threshold = 0.01
-        kappa_active = int(np.sum(np.abs(self.final_kappa) >= param_active_threshold))
-        k = n_biomarkers + kappa_active + 1
-
-        # Clinical params only if cognitive weight > 0
-        if self.lambda_cog > 0 and hasattr(self, "cluster_cog_a") and self.cluster_cog_a:
-            first_cog_a = np.asarray(self.cluster_cog_a[0])
-            n_cog = first_cog_a.shape[0]
-            k += n_cog * n_subtypes  # cog_a per subtype; cog_b counted as 1 per subtype typically
-            # If you store cog_b as scalar per subtype: add n_subtypes
-            k += n_subtypes  # cog_b per subtype
-
-        # Forcing terms: count f >= threshold per subtype (f < 0.01 treated as effectively zero)
-        f_param_threshold = param_active_threshold
-        for subtype in range(n_subtypes):
-            f_sub = np.ravel(self.cluster_f[subtype])
-            k += int(np.sum(f_sub >= f_param_threshold))
-
-        return k
-
-    def bic(self, X: list = None) -> float:
-        """
-        BIC = K*ln(n) + 2*SSE_norm (lower is better).
-        n = total scalar observations (biomarkers * timepoint-subjects).
-        SSE_norm = sum over biomarkers of (SSE_b / sigma_b^2).
-        sigma_b^2 = null/reference variance for biomarker b (overall variance on training data),
-        so the fit term varies across models instead of canceling.
-        """
-        if not hasattr(self, "n_obs_") or not hasattr(self, "lse_final"):
-            raise RuntimeError("fit() must be called before bic()")
-        if not hasattr(self, "_sse_per_biomarker") or not hasattr(self, "_n_obs_rows"):
-            raise RuntimeError("fit() must have set _sse_per_biomarker and _n_obs_rows")
-        if not hasattr(self, "_var_per_biomarker_null"):
-            raise RuntimeError("fit() must have set _var_per_biomarker_null (null variance per biomarker)")
-
-        n = self.n_obs_  # total scalar observations
-        n_obs_rows = self._n_obs_rows
-        n_biomarkers = self._sse_per_biomarker.shape[0]
-        # df = max(n_obs_rows - 1, 1)  # 2/23/26: used for sigma^2 = SSE/df (caused cancelation)
-
-        sse_norm = 0.0
-        for b in range(n_biomarkers):
-            # sigma2_b = max(self._sse_per_biomarker[b] / df, 1e-12)
-            sigma2_b = self._var_per_biomarker_null[b]  # null reference: overall variance of biomarker b
-            sse_norm += self._sse_per_biomarker[b] / sigma2_b
-
-        k = self._bic_n_params()
-        # BIC = k * np.log(n) - 2.0 * sse_norm  # 2/23/26: switched sign to +
-        BIC = k * np.log(n) + 2.0 * sse_norm
-        return float(BIC)
-
-
-def fit_subtyping_em_with_assignments(
-    X: list,
-    initial_assignments: np.ndarray,
-    em_kwargs: dict,
-    run_index: int = 0,
-    seed_offset: int = 0
-):
-    """
-    Fit a SubtypingEM model with a specific initial assignment.
-    Designed to be called in parallel.
-    
-    Parameters
-    ----------
-    X : list
-        List of patient dictionaries
-    initial_assignments : np.ndarray
-        Initial cluster assignments for each patient
-    em_kwargs : dict
-        Keyword arguments to pass to SubtypingEM constructor
-    run_index : int
-        Index of this run (for RNG seeding)
-    seed_offset : int
-        Base seed offset for RNG
-    
-    Returns
-    -------
-    dict
-        Dictionary containing the fitted model and results
-    """
-    rng = np.random.default_rng(75 + seed_offset + run_index)
-    
-    # Create a copy of em_kwargs and add rng and initial_assignments
-    kwargs = em_kwargs.copy()
-    kwargs['rng'] = rng
-    kwargs['initial_assignments'] = initial_assignments
-    
-    try:
-        em = SubtypingEM(**kwargs)
-        em.fit(X=X, y=None)
-        
-        result = {
-            'run_index': run_index,
-            'model': em,
-            'beta_history': em.beta_history,
-            'kappa_history': em.kappa_history,
-            'lse_history': em.lse_history,
-            'assignment_history': em.assignment_history,
-            'final_assignments': em.final_assignments,
-            'initial_assignments': initial_assignments,
-            'final_lse': em.lse_history[-1] if len(em.lse_history) > 0 else np.inf,
-            'success': True,
-        }
-        return result
-    except Exception as e:
-        # Return a failed result with very high LSE so it won't be selected as best
-        result = {
-            'run_index': run_index,
-            'model': None,
-            'beta_history': None,
-            'kappa_history': None,
-            'lse_history': None,
-            'assignment_history': None,
-            'final_assignments': None,
-            'initial_assignments': initial_assignments,
-            'final_lse': np.inf,  # Very high LSE so it won't be selected
-            'success': False,
-            'error': str(e)
-        }
-        
-        return result
-
-
-def run_multiple_initializations_parallel(
-    X: list,
-    n_initializations: int,
-    em_kwargs: dict,
-    n_jobs: int = -1,
-    prefer: str = "processes",
-    seed_offset: int = 0,
-    rng: np.random.Generator = None
-):
-    """
-    Run multiple SubtypingEM fits with different random initial assignments in parallel.
-    
-    Parameters
-    ----------
-    X : list
-        List of patient dictionaries
-    n_initializations : int
-        Number of different initializations to try
-    em_kwargs : dict
-        Keyword arguments to pass to SubtypingEM constructor
-    n_jobs : int
-        Number of parallel jobs (-1 for all cores)
-    prefer : str
-        Preferred backend: "processes" or "threads"
-    seed_offset : int
-        Base seed offset for RNG
-    rng : np.random.Generator, optional
-        Random number generator for creating initial assignments
-        
-    Returns
-    -------
-    tuple
-        (successful_results, best_idx) where:
-        - successful_results: List of successful result dictionaries (failed runs are filtered out)
-        - best_idx: Index of best result within successful_results list
-    """
-    from joblib import Parallel, delayed
-    
-    n_patients = len(X)
-    n_subtypes = em_kwargs.get('n_subtypes', 2)
-    
-    if rng is None:
-        rng = np.random.default_rng(75 + seed_offset)
-    
-    # Generate random initial assignments for each run
-    initial_assignments_list = [
-        rng.integers(0, n_subtypes, size=n_patients)
-        for _ in range(n_initializations)
-    ]
-    
-    # Create jobs
-    jobs = []
-    for idx, assignments in enumerate(initial_assignments_list):
-        jobs.append(delayed(fit_subtyping_em_with_assignments)(
-            X, assignments, em_kwargs, run_index=idx, seed_offset=seed_offset
-        ))
-    
-    # Run in parallel
-    results = Parallel(n_jobs=n_jobs, prefer=prefer)(jobs)
-    
-    # Filter out failed results
-    successful_results = [r for r in results if r.get('success', True)]
-    failed_count = len(results) - len(successful_results)
-    
-    if failed_count > 0:
-        print(f"Warning: {failed_count} out of {n_initializations} initializations failed")
-        # Print error messages for failed runs
-        for r in results:
-            if not r.get('success', True):
-                print(f"  Run {r['run_index']} failed: {r.get('error', 'Unknown error')}")
-    
-    if len(successful_results) == 0:
-        raise RuntimeError("All initializations failed! Check error messages above.")
-    
-    # Find best result by final LSE (only from successful runs)
-    best_idx_in_successful = np.argmin([r['final_lse'] for r in successful_results])
-    best_result = successful_results[best_idx_in_successful]
-    best_idx_original = best_result['run_index']
-    
-    print(f"Best initialization: run {best_idx_original} with LSE={best_result['final_lse']:.6f}")
-    
-    return successful_results, best_idx_in_successful
