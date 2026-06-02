@@ -50,9 +50,12 @@ def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarra
     #     return J
     
     def jacobian_ode(t, x):
-        J = (1 - x)[:, None] * (K_eff)
-        # J = (1 - x)[:, None] * (scalar_K * K)
-        J[np.diag_indices_from(J)] = -((K_eff @ x) + f)
+        # dx_i/dt = (1 - x_i) * ((K_eff @ x)_i + f_i)
+        # J_ij = (1 - x_i) * K_eff[i,j]  for i != j
+        # J_ii = (1 - x_i) * K_eff[i,i] - ((K_eff @ x)_i + f_i)
+        g = (K_eff @ x) + f
+        J = (1 - x)[:, None] * K_eff
+        J[np.diag_indices_from(J)] = (1 - x) * np.diag(K_eff) - g
         return J    
 
     sol = solve_ivp(

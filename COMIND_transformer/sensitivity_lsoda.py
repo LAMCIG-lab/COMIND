@@ -13,9 +13,10 @@ from scipy.interpolate import interp1d
 
 
 def _ode_jacobian(x: np.ndarray, K_eff: np.ndarray, f: np.ndarray) -> np.ndarray:
+    """Jacobian of dx/dt = (I - diag(x)) @ (K_eff @ x + f)."""
     g = K_eff @ x + f
     J = (1.0 - x)[:, None] * K_eff
-    J[np.diag_indices_from(J)] = -g
+    J[np.diag_indices_from(J)] = (1.0 - x) * np.diag(K_eff) - g
     return J
 
 
