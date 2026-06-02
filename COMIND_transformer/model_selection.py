@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from .utils import solve_system
+
 def count_bic_params(final_s, final_kappa, cluster_f, n_subtypes, lambda_cog, cluster_cog_a=None):
     """
     Count free model parameters for BIC.
@@ -66,3 +68,44 @@ def compute_bic(sse_per_biomarker, var_per_biomarker_null, n_obs, k):
     sigma2   = np.maximum(var_per_biomarker_null, 1e-12)
     sse_norm = np.sum(sse_per_biomarker / sigma2)
     return float(k * np.log(n_obs) + 2.0 * sse_norm)
+
+
+def compute_sse_per_biomarker(
+    X_obs,
+    dt,
+    ids,
+    beta,
+    assignments,
+    cluster_f,
+    s,
+    scalar_K,
+    kappa,
+    K,
+    t_span,
+):
+    """
+    Sum of squared errors per biomarker on training data.
+
+    Returns
+    -------
+    sse_per_b : (n_biomarkers,)
+    """
+    n_biomarkers = X_obs.shape[1]
+    n_subtypes = len(cluster_f)
+    sse_per_b = np.zeros(n_biomarkers)
+    x0 = np.zeros(n_biomarkers)
+    X_pred_by_cluster = [
+        solve_system(x0, np.ravel(cluster_f[subtype]), K, t_span, scalar_K, kappa)
+        for subtype in range(n_subtypes)
+    ]
+    for r in range(X_obs.shape[0]):
+        patient_id = ids[r]
+        subtype = assignments[patient_id]
+        beta_r = beta[patient_id]
+        t = beta_r + dt[r]
+        X_pred_sub = X_pred_by_cluster[subtype]
+        pred_r = np.array([
+            np.interp(t, t_span, X_pred_sub[b] * s[b]) for b in range(n_biomarkers)
+        ])
+        sse_per_b += (X_obs[r] - pred_r) ** 2
+    return sse_per_b
