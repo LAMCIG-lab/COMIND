@@ -58,11 +58,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     and patient-specific time shifts from cross-sectional observations.
 
     Global (s, kappa, scalar_K) and cluster (f) θ-steps use staged optimizers
-    from ``theta_solver_stages`` (default ``nelder_mead`` only). Typical full
-    chain: ``lbfgs_approx`` → ``lbfgs_exact`` → ``nelder_mead``.
-
-    Legacy ``jac_toggle=True`` selects the full chain; ``jac_toggle=False``
-    keeps only ``nelder_mead``.
+    from ``theta_solver_stages`` (default ``lbfgs_approx`` → ``nelder_mead``).
+    Add ``lbfgs_exact`` for exact LSODA sensitivities (slower).
 
     Each outer iteration starts from the cheapest solver. If reconstruction LSE
     improvement is too small, the iteration retries with the next stage. After
@@ -100,7 +97,6 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         initial_cluster_cog_b: np.ndarray = None,
         initial_beta: np.ndarray = None,
         theta_solver_stages=None,
-        jac_toggle: bool = False,
         epsilon: float = 1e-2,
         relative_tolerance: float = 1e-3,
         n_subtypes: int = 2,
@@ -133,11 +129,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
         if theta_solver_stages is not None:
             self.theta_solver_stages = tuple(theta_solver_stages)
-        elif jac_toggle:
-            self.theta_solver_stages = ("lbfgs_approx", "lbfgs_exact", "nelder_mead")
         else:
-            self.theta_solver_stages = ("nelder_mead",)
-        self.jac_toggle = jac_toggle
+            self.theta_solver_stages = ("lbfgs_approx", "nelder_mead")
 
         self.epsilon = epsilon
         self.relative_tolerance = relative_tolerance
@@ -238,8 +231,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.subtype_mapping = get_subtype_mapping_from_f(self.cluster_f, true_f_list)
         if verbose:
             print(f"\nSubtype mapping (fitted → true): {self.subtype_mapping}")
-            for fitted, true in self.subtype_mapping.items():
-                print(f"  Fitted subtype {fitted} → True subtype {true}")
+            for fitted in range(len(self.subtype_mapping)):
+                print(
+                    f"  Fitted subtype {fitted} → True subtype "
+                    f"{int(self.subtype_mapping[fitted])}"
+                )
         return self.subtype_mapping
 
     def _prepare_data(self, X):
@@ -528,7 +524,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 ids=ids,
                 K=self.K,
                 t_span=self.t_span,
-                solver_stage=current_solver,
+                method=current_solver,
                 beta_pred=state["current_beta"],
                 s_guess=state["current_s"],
                 kappa_guess=state["current_kappa"],
@@ -622,7 +618,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     s=state["current_s"],
                     scalar_K=state["current_scalar_K"],
                     lambda_f=self.lambda_f,
-                    solver_stage=current_solver,
+                    method=current_solver,
                     beta_pred=state["current_beta"][cl_idx],
                     f_guess=np.ravel(state["cluster_f"][z]),
                     rng=self.rng,

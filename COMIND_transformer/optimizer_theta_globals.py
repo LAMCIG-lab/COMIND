@@ -2,7 +2,7 @@ import numpy as np
 from scipy.optimize import minimize
 from .utils import solve_system
 from .sensitivity_lsoda import (
-    integrate_linear_sensitivity_lsoda,
+    integrate_all_sensitivities_lsoda,
     interp_sensitivity_at_obs,
 )
 
@@ -25,112 +25,114 @@ def _pseudo_huber_grad(values: np.ndarray, delta: float = SPARSE_PSEUDO_HUBER_DE
     values = np.asarray(values, dtype=float)
     return values / np.sqrt(1.0 + (values / delta) ** 2)
 
-def theta_s_loss_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
-                       K: np.ndarray, t_span: np.ndarray, cluster_f: list,
-                       observation_assignments: np.ndarray,
-                       lambda_s: float = 0.0, lambda_scalar: float = 0.0,
-                       lambda_kappa: float = 0.0) -> float:
-    """
-    Loss for s and scalar_K when each observation uses its assigned subtype's f.
-    observation_assignments[i] = subtype index for the i-th observation row.
-    """
-    n_biomarkers = x_obs.shape[1]
-    s = params[:n_biomarkers]
-    kappa = params[n_biomarkers:-1]
-    scalar_K = params[-1]
-    x0 = np.zeros(n_biomarkers)
 
-    # One trajectory per subtype (unscaled then scale by s)
-    n_subtypes = len(cluster_f)
-    x_scaled_list = []
-    for k in range(n_subtypes):
-        f_k = np.ravel(cluster_f[k])
-        x_k = solve_system(x0, f_k, K, t_span, scalar_K, kappa)
-        x_scaled_k = s[:, None] * x_k
-        x_scaled_list.append(x_scaled_k)
-
-    # Predicted value per observation: vectorize by subtype (one interp per subtype per biomarker)
-    x_pred = np.zeros_like(x_obs)
-    for k in range(n_subtypes):
-        mask_k = (observation_assignments == k)
-        if not np.any(mask_k):
-            continue
-        t_k = t_obs[mask_k]
-        for j in range(n_biomarkers):
-            x_pred[mask_k, j] = np.interp(t_k, t_span, x_scaled_list[k][j])
-
-    residuals = x_obs - x_pred
-    # loss = np.sum(residuals ** 2) + lambda_s * np.sum(s ** 2) + lambda_scalar * scalar_K ** 2  # old L2
-    scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
-    lognorm_penalty = 0.5 * lambda_scalar * (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) ** 2
-    loss = (
-        np.sum(residuals ** 2)
-        + lambda_s * np.sum(s ** 2)
-        + lognorm_penalty
-        # + lambda_kappa * _pseudo_huber_penalty(kappa)
-        + lambda_kappa * np.sum(np.abs(kappa))
-    )
-    return loss
-
-def theta_s_loss_jac_exact_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: np.ndarray,
-                                 K: np.ndarray, t_span: np.ndarray, cluster_f: list,
-                                 observation_assignments: np.ndarray,
-                                 lambda_s: float = 0.0, lambda_scalar: float = 0.0,
-                                 lambda_kappa: float = 0.0) -> tuple:
-    """
-    Same loss as theta_s_loss_multi; gradients via sensitivity IVPs integrated
-    with LSODA on the stored forward trajectory.
-    """
+def _solve_and_residuals(
+    params: np.ndarray,
+    t_obs: np.ndarray,
+    x_obs: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    cluster_f: list,
+    observation_assignments: np.ndarray,
+):
+    """Unpack globals, solve subtype trajectories, build x_pred and residuals."""
     n_biomarkers = x_obs.shape[1]
     s = params[:n_biomarkers]
     kappa = params[n_biomarkers:-1]
     scalar_K = params[-1]
     x0 = np.zeros(n_biomarkers)
     n_subtypes = len(cluster_f)
-    K_eff = scalar_K * K + np.diag(kappa)
 
     x_list = []
-    x_scaled_list = []
     for k in range(n_subtypes):
         f_k = np.ravel(cluster_f[k])
         x_k = solve_system(x0, f_k, K, t_span, scalar_K, kappa)
         x_list.append(x_k)
-        x_scaled_k = s[:, None] * x_k
-        x_scaled_list.append(x_scaled_k)
 
     x_pred = np.zeros_like(x_obs)
     for k in range(n_subtypes):
-        mask_k = (observation_assignments == k)
+        mask_k = observation_assignments == k
         if not np.any(mask_k):
             continue
         t_k = t_obs[mask_k]
+        x_scaled_k = s[:, None] * x_list[k]
         for j in range(n_biomarkers):
-            x_pred[mask_k, j] = np.interp(t_k, t_span, x_scaled_list[k][j])
+            x_pred[mask_k, j] = np.interp(t_k, t_span, x_scaled_k[j])
 
     residuals = x_obs - x_pred
+    return s, kappa, scalar_K, x_list, x_pred, residuals
+
+
+def theta_s_loss_multi(
+    params: np.ndarray,
+    t_obs: np.ndarray,
+    x_obs: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    cluster_f: list,
+    observation_assignments: np.ndarray,
+    lambda_s: float = 0.0,
+    lambda_scalar: float = 0.0,
+    lambda_kappa: float = 0.0,
+) -> float:
+    """
+    Loss for s and scalar_K when each observation uses its assigned subtype's f.
+    observation_assignments[i] = subtype index for the i-th observation row.
+    """
+    s, kappa, scalar_K, _x_list, _x_pred, residuals = _solve_and_residuals(
+        params, t_obs, x_obs, K, t_span, cluster_f, observation_assignments
+    )
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
-    lognorm_penalty = 0.5 * lambda_scalar * (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) ** 2
+    lognorm_penalty = 0.5 * lambda_scalar * (
+        np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)
+    ) ** 2
+    return (
+        np.sum(residuals ** 2)
+        + lambda_s * np.sum(s ** 2)
+        + lognorm_penalty
+        + lambda_kappa * np.sum(kappa)
+    )
+
+
+def theta_s_loss_jac_exact_multi(
+    params: np.ndarray,
+    t_obs: np.ndarray,
+    x_obs: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    cluster_f: list,
+    observation_assignments: np.ndarray,
+    lambda_s: float = 0.0,
+    lambda_scalar: float = 0.0,
+    lambda_kappa: float = 0.0,
+) -> tuple:
+    """
+    Same loss as theta_s_loss_multi; gradients via sensitivity IVPs integrated
+    with LSODA on the stored forward trajectory.
+    """
+    s, kappa, scalar_K, x_list, _x_pred, residuals = _solve_and_residuals(
+        params, t_obs, x_obs, K, t_span, cluster_f, observation_assignments
+    )
+    n_biomarkers = x_obs.shape[1]
+    scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
+    lognorm_penalty = 0.5 * lambda_scalar * (
+        np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)
+    ) ** 2
     loss = (
         np.sum(residuals ** 2)
         + lambda_s * np.sum(s ** 2)
         + lognorm_penalty
-        # + lambda_kappa * _pseudo_huber_penalty(kappa)
-        + lambda_kappa * np.sum(np.abs(kappa))
+        + lambda_kappa * np.sum(kappa)
     )
 
+    K_eff = scalar_K * K + np.diag(kappa)
     sens_records = []
     for k, f_k in enumerate(cluster_f):
         f_k = np.ravel(f_k)
         x_k = x_list[k]
-        u_sk = integrate_linear_sensitivity_lsoda(
-            t_span, x_k, K_eff, K, f_k, "scalar_K"
-        )
-        u_kappa = [
-            integrate_linear_sensitivity_lsoda(
-                t_span, x_k, K_eff, K, f_k, "kappa_diag", b
-            )
-            for b in range(n_biomarkers)
-        ]
+        U_k = integrate_all_sensitivities_lsoda(t_span, x_k, K_eff, K, f_k)
+        u_sk = U_k[:, 0, :]
+        u_kappa = [U_k[:, b + 1, :] for b in range(n_biomarkers)]
         sens_records.append((x_k, u_sk, u_kappa))
 
     grad_s = 2.0 * lambda_s * s.copy()
@@ -138,7 +140,7 @@ def theta_s_loss_jac_exact_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: n
     grad_scalar_K = 0.0
 
     for k, (x_k, u_sk, u_kappa) in enumerate(sens_records):
-        mask_k = (observation_assignments == k)
+        mask_k = observation_assignments == k
         if not np.any(mask_k):
             continue
         t_k = np.clip(t_obs[mask_k], t_span[0], t_span[-1])
@@ -152,7 +154,7 @@ def theta_s_loss_jac_exact_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: n
         for b in range(n_biomarkers):
             u_b_at = interp_sensitivity_at_obs(u_kappa[b], t_span, t_k)
             grad_kappa[b] -= 2.0 * np.sum(res_k * s[None, :] * u_b_at)
-    # grad_kappa += lambda_kappa * _pseudo_huber_grad(kappa)
+
     grad_kappa += lambda_kappa * np.sign(kappa)
 
     grad_scalar_K += lambda_scalar * (
@@ -162,28 +164,34 @@ def theta_s_loss_jac_exact_multi(params: np.ndarray, t_obs: np.ndarray, x_obs: n
     return loss, grad
 
 
-def fit_theta_globals(X_obs: np.ndarray, dt_obs: np.ndarray, ids: np.ndarray, K: np.ndarray,
-                      t_span: np.ndarray, cluster_f: list, assignments: np.ndarray,
-                      beta_pred: np.ndarray = None,
-                      s_guess: np.ndarray = None, scalar_K_guess: float = None, kappa_guess: np.ndarray = None,
-                      lambda_s: float = 0.0, lambda_scalar: float = 0.0, lambda_kappa: float = 0.0,
-                      solver_stage: str = "lbfgs_approx") -> tuple:
+def fit_theta_globals(
+    X_obs: np.ndarray,
+    dt_obs: np.ndarray,
+    ids: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    cluster_f: list,
+    assignments: np.ndarray,
+    beta_pred: np.ndarray = None,
+    s_guess: np.ndarray = None,
+    scalar_K_guess: float = None,
+    kappa_guess: np.ndarray = None,
+    lambda_s: float = 0.0,
+    lambda_scalar: float = 0.0,
+    lambda_kappa: float = 0.0,
+    method: str = "lbfgs_approx",
+) -> tuple:
     """
     Optimizes global (s, kappa, scalar_K) using assignment-aware subtype trajectories.
 
-    solver_stage:
+    method:
         'lbfgs_approx' — L-BFGS-B, jac=False (SciPy finite-difference gradient).
         'lbfgs_exact'  — L-BFGS-B, jac=True, exact sensitivities solved with LSODA.
         'nelder_mead'  — derivative-free, loss only.
     """
-    unique_ids = np.unique(ids)
-    id_to_index = {pid: i for i, pid in enumerate(unique_ids)}
-    index_array = np.array([id_to_index[i] for i in ids])  # shape: (n_obs,)
-    t_pred = dt_obs + beta_pred[index_array]
-
+    t_pred = dt_obs + beta_pred[ids]
     n_biomarkers = X_obs.shape[1]
 
-    # Initial guesses if None
     if s_guess is None:
         s_guess = np.ones(n_biomarkers)
     if scalar_K_guess is None:
@@ -191,25 +199,26 @@ def fit_theta_globals(X_obs: np.ndarray, dt_obs: np.ndarray, ids: np.ndarray, K:
     if kappa_guess is None:
         kappa_guess = np.zeros(K.shape[0])
     initial_params = np.concatenate([s_guess, kappa_guess, [scalar_K_guess]])
-    bounds = ([(0.0, np.inf)] * n_biomarkers +             # s bounds
-              [(0.0, np.inf)] * n_biomarkers +             # kappa bounds
-              [(0.0, np.inf)])                             # scalar_K bound
+    bounds = (
+        [(0.0, np.inf)] * n_biomarkers
+        + [(0.0, np.inf)] * n_biomarkers
+        + [(0.0, np.inf)]
+    )
 
-    observation_assignments = assignments[index_array]  # assignment per observation row
-    if solver_stage == "lbfgs_exact":
-        loss_function = theta_s_loss_jac_exact_multi
-        use_jac = True
-    elif solver_stage == "lbfgs_approx":
-        loss_function = theta_s_loss_multi
-        use_jac = False
-    elif solver_stage == "nelder_mead":
-        loss_function = theta_s_loss_multi
-        use_jac = False
+    observation_assignments = assignments[ids]
+
+    if method == "lbfgs_exact":
+        loss_fn, scipy_method, use_jac = theta_s_loss_jac_exact_multi, "L-BFGS-B", True
+    elif method == "lbfgs_approx":
+        loss_fn, scipy_method, use_jac = theta_s_loss_multi, "L-BFGS-B", False
+    elif method == "nelder_mead":
+        loss_fn, scipy_method, use_jac = theta_s_loss_multi, "Nelder-Mead", False
     else:
         raise ValueError(
-            f"Unknown solver_stage={solver_stage!r}; use "
+            f"Unknown method={method!r}; use "
             "'lbfgs_approx', 'lbfgs_exact', or 'nelder_mead'."
         )
+
     args = (
         t_pred,
         X_obs,
@@ -222,27 +231,18 @@ def fit_theta_globals(X_obs: np.ndarray, dt_obs: np.ndarray, ids: np.ndarray, K:
         lambda_kappa,
     )
 
-    if solver_stage == "nelder_mead":
-        result = minimize(
-            loss_function,
-            initial_params,
-            args=args,
-            method="Nelder-Mead",
-            bounds=bounds,
-        )
-    else:
-        result = minimize(
-            loss_function,
-            initial_params,
-            args=args,
-            method="L-BFGS-B",
-            jac=use_jac,
-            bounds=bounds,
-        )
+    result = minimize(
+        loss_fn,
+        initial_params,
+        args=args,
+        method=scipy_method,
+        jac=use_jac,
+        bounds=bounds,
+    )
 
     fitted_params = result.x
     s_fit = fitted_params[:n_biomarkers]
     kappa_fit = fitted_params[n_biomarkers:-1]
     scalar_K_fit = fitted_params[-1]
 
-    return s_fit, kappa_fit,scalar_K_fit
+    return s_fit, kappa_fit, scalar_K_fit
