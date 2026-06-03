@@ -126,3 +126,75 @@ def load_warm_start_from_npz(
     finally:
         if close_after:
             data.close()
+
+
+def load_legacy_presubtyping_from_npz(
+    npz_path: PathLike,
+    patient_ids: Sequence,
+    *,
+    n_biomarkers: int = 68,
+    theta_history_key: str = "theta_history",
+    beta_history_key: str = "beta_history",
+    cog_history_key: str = "cog_history",
+    theta_column: int = -1,
+    beta_column: int = -1,
+) -> dict:
+    """
+    Warm-start from pre-subtyping COMIND checkpoints (Z=1, no kappa in file).
+
+    ``theta_history`` final column is ``[f (n), s (n), scalar_K (1)]``.
+    ``cog_history`` final column is ``[cog_a (n_cog), cog_b (1)]``.
+    ``beta_history`` rows must align with ``patient_ids`` order (same train split).
+    """
+    if not isinstance(npz_path, np.lib.npyio.NpzFile):
+        data = np.load(npz_path, allow_pickle=True)
+        close_after = True
+    else:
+        data = npz_path
+        close_after = False
+
+    try:
+        theta = np.asarray(data[theta_history_key], dtype=float)[:, theta_column].ravel()
+        expected = 2 * n_biomarkers + 1
+        if theta.size != expected:
+            raise ValueError(
+                f"theta column length {theta.size} != 2*n_biomarkers+1 ({expected})"
+            )
+        f = theta[:n_biomarkers]
+        s = theta[n_biomarkers : 2 * n_biomarkers]
+        scalar_K = float(theta[2 * n_biomarkers])
+
+        cog_hist = np.asarray(data[cog_history_key], dtype=float)
+        if cog_hist.ndim != 2 or cog_hist.shape[0] < 2:
+            raise ValueError(f"unexpected cog_history shape {cog_hist.shape}")
+        cog_vec = cog_hist[:, theta_column]
+        # cog_history: (n_cog + 1, T) — coefficients then intercept
+        n_cog = cog_hist.shape[0] - 1
+        cog_a = cog_vec[:n_cog]
+        cog_b = float(cog_vec[n_cog])
+
+        beta_hist = np.asarray(data[beta_history_key], dtype=float)
+        if beta_hist.ndim != 2:
+            raise ValueError(f"beta_history must be 2-D, got {beta_hist.shape}")
+        if beta_hist.shape[0] != len(patient_ids):
+            raise ValueError(
+                f"beta_history rows {beta_hist.shape[0]} != len(patient_ids) "
+                f"({len(patient_ids)}); ensure the same train split/order."
+            )
+        beta = beta_hist[:, beta_column].astype(float, copy=False)
+
+        n_subtypes = 1
+        return {
+            "initial_f": f.reshape(1, n_biomarkers),
+            "initial_s": s,
+            "initial_scalar_K": scalar_K,
+            "initial_kappa": np.zeros(n_biomarkers, dtype=float),
+            "initial_assignments": np.zeros(len(patient_ids), dtype=int),
+            "initial_cluster_cog_a": cog_a.reshape(1, n_cog),
+            "initial_cluster_cog_b": np.array([cog_b], dtype=float),
+            "initial_beta": beta,
+            "n_subtypes": n_subtypes,
+        }
+    finally:
+        if close_after:
+            data.close()

@@ -13,6 +13,9 @@ fit() is organized into four helpers:
 E-step and BIC helpers live in assignments.py and model_selection.py.
 """
 
+import os
+import signal
+import time
 import numpy as np
 from tqdm import tqdm
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -145,14 +148,33 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.verbose = verbose
         self.n_beta_grid = n_beta_grid
 
-    def fit(self, X: list, y=None):
+    def fit(self, X: list, y=None, checkpoint_path=None):
+        """
+        Fit on patient list ``X``.
+
+        Parameters
+        ----------
+        checkpoint_path : str or None
+            If set, write an atomic overwrite checkpoint after each accepted EM
+            iteration (for recovery after walltime limits). Not used during CV
+            unless you pass it on fold fits (not recommended).
+        """
         self.t_span = np.linspace(0.0, self.t_max, int(self.t_max / self.step))
         self.assignment_probabilities_ = None
+        self._checkpoint_path = checkpoint_path
+        self._checkpoint_X = X
+        self._checkpoint_snapshot = None
 
         flat = self._prepare_data(X)
         state = self._initialize_state(flat, X)
-        self._run_em_loop(state, flat)
-        self._finalize_fit(state, flat, X)
+        self._register_checkpoint_signal_handler()
+        try:
+            self._run_em_loop(state, flat, X)
+            self._finalize_fit(state, flat, X)
+            if self._checkpoint_path:
+                self._save_fit_checkpoint(state, flat, X, fit_complete=True)
+        finally:
+            self._unregister_checkpoint_signal_handler()
         return self
 
     def transform(self, X: list, use_cognitive_prior: bool = True) -> np.ndarray:
@@ -430,6 +452,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 [cluster_cog_a[z], [cluster_cog_b[z]]]
             )
 
+        iter_time_hist = np.zeros(T, dtype=float)
+        solver_hist = [""] * T
+        assign_change_hist = np.zeros(T, dtype=int)
+
         return dict(
             current_beta=beta.copy(),
             current_s=s,
@@ -448,12 +474,15 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             lse_hist=lse_hist,
             cog_reg_hist=cog_reg_hist,
             assign_hist=assign_hist,
+            iter_time_hist=iter_time_hist,
+            solver_hist=solver_hist,
+            assign_change_hist=assign_change_hist,
             best_lse=np.inf,
             loop_iter=0,
             final_lse=initial_lse,
         )
 
-    def _run_em_loop(self, state, flat):
+    def _run_em_loop(self, state, flat, X):
         """Outer EM loop with checkpointing and θ-solver escalation."""
         if self.verbose >= 1:
             pbar = tqdm(total=self.max_iter)
@@ -466,6 +495,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             pbar = _NoPbar()
 
         while state["loop_iter"] < self.max_iter:
+            iter_start = time.perf_counter()
             hist_idx = state["loop_iter"] + 1
             ck = self._checkpoint(state)
             solver_phase_idx = 0
@@ -510,6 +540,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 state["final_lse"] = float(state["best_lse"])
                 break
 
+            state["iter_time_hist"][hist_idx] = time.perf_counter() - iter_start
+            state["solver_hist"][hist_idx] = current_solver
+            state["assign_change_hist"][hist_idx] = int(
+                np.sum(state["assignments"] != ck["assignments"])
+            )
+
             self._record_history(state, lse, hist_idx)
             state["best_lse"] = (
                 lse
@@ -519,6 +555,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             state["final_lse"] = lse
             state["loop_iter"] += 1
             pbar.update(1)
+            self._save_fit_checkpoint(state, flat, X, fit_complete=False)
 
     def _em_step(self, state, flat, current_solver):
         """One EM iteration (global θ, E-step, cog regression, cluster f, beta)."""
@@ -674,6 +711,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.cog_regression_history = state["cog_reg_hist"][:, :, :_h]
         self.assignment_history = state["assign_hist"][:, :_h]
 
+        self.iter_times = state["iter_time_hist"][1:_h]
+        self.accepted_solver_stages = state["solver_hist"][1:_h]
+        self.assign_changes = state["assign_change_hist"][1:_h]
+
         self.cluster_f = state["cluster_f"]
         self.final_scalar_K = state["current_scalar_K"]
         self.final_s = state["current_s"]
@@ -746,11 +787,25 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.lambda_cog,
             self.cluster_cog_a,
         )
+        self.bic_n_params_ = k
         self.bic_ = compute_bic(
             self._sse_per_biomarker,
             self._var_per_biomarker_null,
             self.n_obs_,
             k,
+        )
+
+    def _bic_n_params(self):
+        """Backward-compatible BIC parameter count (same as ``bic_n_params_`` after ``fit``)."""
+        if hasattr(self, "bic_n_params_"):
+            return int(self.bic_n_params_)
+        return count_bic_params(
+            self.final_s,
+            self.final_kappa,
+            self.cluster_f,
+            self.n_subtypes,
+            self.lambda_cog,
+            self.cluster_cog_a,
         )
 
     @staticmethod
@@ -784,6 +839,80 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         state["assignments"] = np.copy(ck["assignments"])
         state["cluster_cog_a"] = [np.copy(a) for a in ck["cog_a"]]
         state["cluster_cog_b"] = list(ck["cog_b"])
+
+    def _register_checkpoint_signal_handler(self):
+        """Save latest checkpoint on SIGTERM (e.g. PBS walltime warning)."""
+        if not self._checkpoint_path:
+            return
+
+        def _on_term(signum, frame):
+            del signum, frame
+            snap = self._checkpoint_snapshot
+            if snap is None:
+                return
+            st, fl, x_list = snap
+            try:
+                self._save_fit_checkpoint(st, fl, x_list, fit_complete=False)
+            except Exception as exc:
+                print(f"Checkpoint on SIGTERM failed: {exc}")
+
+        self._checkpoint_term_handler = _on_term
+        signal.signal(signal.SIGTERM, _on_term)
+
+    def _unregister_checkpoint_signal_handler(self):
+        if getattr(self, "_checkpoint_term_handler", None) is not None:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            self._checkpoint_term_handler = None
+
+    def _save_fit_checkpoint(self, state, flat, X, *, fit_complete: bool):
+        """Atomically overwrite ``checkpoint_path`` with warm-startable progress."""
+        path = self._checkpoint_path
+        if not path:
+            return
+
+        self._checkpoint_snapshot = (state, flat, X)
+        _h = state["loop_iter"] + 1
+        train_ids = np.array([p["id"] for p in X])
+
+        payload = dict(
+            fit_complete=fit_complete,
+            loop_iter=int(state["loop_iter"]),
+            best_lse=float(state["best_lse"]),
+            final_lse=float(state["final_lse"]),
+            n_subtypes=int(self.n_subtypes),
+            train_ids=train_ids,
+            train_assignments=np.copy(state["assignments"]),
+            cluster_f=np.array(state["cluster_f"], dtype=float),
+            cluster_cog_a=np.array(state["cluster_cog_a"], dtype=float),
+            cluster_cog_b=np.array(state["cluster_cog_b"], dtype=float),
+            final_s=np.copy(state["current_s"]),
+            final_kappa=np.copy(state["current_kappa"]),
+            final_scalar_K=float(state["current_scalar_K"]),
+            beta_history=np.copy(state["beta_hist"][:, :_h]),
+            assignment_history=np.copy(state["assign_hist"][:, :_h]),
+            lse_history=np.copy(state["lse_hist"][:_h]),
+            kappa_history=np.copy(state["kappa_hist"][:, :_h]),
+            cog_history=np.copy(state["cog_reg_hist"][:, :, :_h]),
+            theta_history=np.copy(state["theta_hist"][:, :_h]),
+            iter_times=np.copy(state["iter_time_hist"][1:_h]),
+            accepted_solver_stages=np.array(state["solver_hist"][1:_h], dtype=object),
+            assign_changes=np.copy(state["assign_change_hist"][1:_h]),
+            theta_solver_stages=np.array(self.theta_solver_stages, dtype=object),
+            max_iter=int(self.max_iter),
+        )
+
+        tmp_path = path + ".tmp"
+        out_dir = os.path.dirname(path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        np.savez(tmp_path, **payload)
+        os.replace(tmp_path, path)
+        if self.verbose >= 1:
+            tag = "complete" if fit_complete else "progress"
+            print(
+                f"Checkpoint ({tag}): {path}  "
+                f"(outer iter {state['loop_iter']}, LSE {state['final_lse']:.6g})"
+            )
 
     def _record_history(self, state, lse, hist_idx):
         state["beta_hist"][:, hist_idx] = state["current_beta"]
