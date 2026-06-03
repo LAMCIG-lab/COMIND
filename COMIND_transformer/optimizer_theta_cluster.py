@@ -7,6 +7,7 @@ from .sensitivity_lsoda import (
     integrate_f_sensitivities_lsoda,
     interp_sensitivity_at_obs,
 )
+from .sensitivity_rk4 import integrate_all_sensitivities_rk4
 
 SPARSE_PSEUDO_HUBER_DELTA = 0.01
 
@@ -136,6 +137,46 @@ def theta_cluster_loss_jac_exact(
     return loss, grad_f
 
 
+def theta_cluster_loss_jac_rk4(
+    params: np.ndarray,
+    t_obs: np.ndarray,
+    x_obs: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    s: np.ndarray,
+    scalar_K: float,
+    lambda_f: float,
+    kappa: np.ndarray = None,
+) -> tuple:
+    """Loss and gradient w.r.t. f using RK4 sensitivities on t_span."""
+    n_biomarkers = x_obs.shape[1]
+    f = params
+    x0 = np.zeros(n_biomarkers)
+    if kappa is None:
+        kappa = np.zeros(n_biomarkers)
+    K_eff = scalar_K * K + np.diag(kappa)
+
+    x = solve_system(x0, f, K, t_span, scalar_K, kappa)
+    x_scaled = s[:, None] * x
+    t_obs_clamped = np.clip(t_obs, t_span[0], t_span[-1])
+    x_pred = np.zeros_like(x_obs)
+    for j in range(n_biomarkers):
+        x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
+
+    residuals = x_obs - x_pred
+    loss = np.sum(residuals ** 2) + lambda_f * np.sum(f)
+
+    U = integrate_all_sensitivities_rk4(
+        t_span, x, K_eff, K, f, param_type="f"
+    )
+    grad_f = lambda_f * np.ones(n_biomarkers)
+    for b in range(n_biomarkers):
+        w_at = interp_sensitivity_at_obs(U[:, b, :], t_span, t_obs_clamped)
+        grad_f[b] -= 2.0 * np.sum(residuals * s[None, :] * w_at)
+
+    return loss, grad_f
+
+
 def fit_theta_cluster(
     X_obs: np.ndarray,
     dt_obs: np.ndarray,
@@ -158,6 +199,7 @@ def fit_theta_cluster(
     method:
         'lbfgs_approx' — L-BFGS-B with cumulative_simpson approximate Jacobian.
         'lbfgs_exact'  — L-BFGS-B with exact LSODA sensitivities.
+        'lbfgs_rk4'    — L-BFGS-B with RK4 sensitivities on t_span.
         'nelder_mead'  — derivative-free, loss only.
     """
     if rng is None:
@@ -173,6 +215,8 @@ def fit_theta_cluster(
 
     if method == "lbfgs_exact":
         loss_fn, scipy_method, use_jac = theta_cluster_loss_jac_exact, "L-BFGS-B", True
+    elif method == "lbfgs_rk4":
+        loss_fn, scipy_method, use_jac = theta_cluster_loss_jac_rk4, "L-BFGS-B", True
     elif method == "lbfgs_approx":
         loss_fn, scipy_method, use_jac = theta_cluster_loss_jac, "L-BFGS-B", True
     elif method == "nelder_mead":
@@ -180,7 +224,7 @@ def fit_theta_cluster(
     else:
         raise ValueError(
             f"Unknown method={method!r}; use "
-            "'lbfgs_approx', 'lbfgs_exact', or 'nelder_mead'."
+            "'lbfgs_approx', 'lbfgs_exact', 'lbfgs_rk4', or 'nelder_mead'."
         )
 
     args = (t_pred, X_obs, K, t_span, s, scalar_K, lambda_f, kappa)

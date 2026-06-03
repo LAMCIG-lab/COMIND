@@ -59,7 +59,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
     Global (s, kappa, scalar_K) and cluster (f) θ-steps use staged optimizers
     from ``theta_solver_stages`` (default ``lbfgs_approx`` → ``nelder_mead``).
-    Add ``lbfgs_exact`` for exact LSODA sensitivities (slower).
+    Add ``lbfgs_exact`` for exact LSODA sensitivities (slower), or ``lbfgs_rk4`` for
+    fixed-step RK4 sensitivities on the forward grid.
 
     Each outer iteration starts from the cheapest solver. If reconstruction LSE
     improvement is too small, the iteration retries with the next stage. After
@@ -104,6 +105,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         jitter_iter: int = 1,
         jitter_temperature: float = 1.0,
         verbose: int = 1,
+        n_beta_grid: int = 20,
     ):
         self.max_iter = max_iter
         self.t_max = t_max
@@ -141,6 +143,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.jitter_temperature = jitter_temperature
 
         self.verbose = verbose
+        self.n_beta_grid = n_beta_grid
 
     def fit(self, X: list, y=None):
         self.t_span = np.linspace(0.0, self.t_max, int(self.t_max / self.step))
@@ -165,6 +168,19 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         lam_cog = self.lambda_cog if use_cognitive_prior else 0.0
         results = np.zeros(len(X), dtype=[("beta", "f8"), ("subtype", "i4")])
 
+        X_preds = [
+            solve_system(
+                np.zeros(n_biomarkers),
+                np.ravel(self.cluster_f[z]),
+                self.K,
+                self.t_span,
+                self.final_scalar_K,
+                self.final_kappa,
+            )
+            for z in range(self.n_subtypes)
+        ]
+        beta_grid = np.linspace(0.1 * self.t_max, 0.9 * self.t_max, self.n_beta_grid)
+
         for idx, p in enumerate(tqdm(X, desc="Estimating beta and subtype assignments")):
             X_obs_i = p["X_obs"]
             dt_i = p["dt"]
@@ -172,27 +188,22 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             if cog_i.ndim == 1:
                 cog_i = cog_i.reshape(-1, 1)
 
-            best_error, best_subtype = np.inf, 0
-            beta_guess = 10.0
+            sse_grid = np.zeros((self.n_beta_grid, self.n_subtypes))
             for z in range(self.n_subtypes):
-                X_pred_z = solve_system(
-                    np.zeros(n_biomarkers),
-                    np.ravel(self.cluster_f[z]),
-                    self.K,
-                    self.t_span,
-                    self.final_scalar_K,
-                    self.final_kappa,
-                )
-                error = reconstruction_sse(
-                    beta_guess, X_obs_i, dt_i, X_pred_z, self.t_span, self.final_s
-                )
-                cog_pred = cog_i @ self.cluster_cog_a[z] + self.cluster_cog_b[z]
-                error += lam_cog * np.sum((dt_i + beta_guess - cog_pred) ** 2)
-                if error < best_error:
-                    best_error, best_subtype = error, z
+                cog_pred_z = cog_i @ self.cluster_cog_a[z] + self.cluster_cog_b[z]
+                for gi, beta_g in enumerate(beta_grid):
+                    sse_grid[gi, z] = reconstruction_sse(
+                        beta_g, X_obs_i, dt_i, X_preds[z], self.t_span, self.final_s
+                    )
+                    if lam_cog > 0:
+                        sse_grid[gi, z] += lam_cog * np.sum(
+                            (dt_i + beta_g - cog_pred_z) ** 2
+                        )
+
+            best_gi, best_z = np.unravel_index(np.argmin(sse_grid), sse_grid.shape)
 
             beta_vec, _ = estimate_beta(
-                beta_all=np.array([beta_guess], dtype=float),
+                beta_all=np.array([beta_grid[best_gi]], dtype=float),
                 X_obs=X_obs_i,
                 dt=dt_i,
                 ids=np.zeros(len(dt_i), dtype=int),
@@ -201,7 +212,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 cluster_f=self.cluster_f,
                 scalar_K=self.final_scalar_K,
                 s=self.final_s,
-                assignments=np.array([best_subtype], dtype=int),
+                assignments=np.array([best_z], dtype=int),
                 K=self.K,
                 cog_a=self.cluster_cog_a,
                 cog_b=self.cluster_cog_b,
@@ -214,7 +225,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 kappa=self.final_kappa,
             )
             results[idx]["beta"] = float(beta_vec[0])
-            results[idx]["subtype"] = best_subtype
+            results[idx]["subtype"] = best_z
 
         self.beta_val = results["beta"]
         self.transform_assignments = results["subtype"]

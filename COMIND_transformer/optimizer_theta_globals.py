@@ -5,6 +5,7 @@ from .sensitivity_lsoda import (
     integrate_all_sensitivities_lsoda,
     interp_sensitivity_at_obs,
 )
+from .sensitivity_rk4 import integrate_all_sensitivities_rk4
 
 # Log-normal prior center for scalar_K (penalty pulls toward this value)
 SCALAR_K_CENTER = 0.25
@@ -164,6 +165,77 @@ def theta_s_loss_jac_exact_multi(
     return loss, grad
 
 
+def theta_s_loss_jac_rk4_multi(
+    params: np.ndarray,
+    t_obs: np.ndarray,
+    x_obs: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    cluster_f: list,
+    observation_assignments: np.ndarray,
+    lambda_s: float = 0.0,
+    lambda_scalar: float = 0.0,
+    lambda_kappa: float = 0.0,
+) -> tuple:
+    """
+    Same loss as theta_s_loss_multi; gradients via RK4 sensitivities on t_span.
+    """
+    s, kappa, scalar_K, x_list, _x_pred, residuals = _solve_and_residuals(
+        params, t_obs, x_obs, K, t_span, cluster_f, observation_assignments
+    )
+    n_biomarkers = x_obs.shape[1]
+    scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
+    lognorm_penalty = 0.5 * lambda_scalar * (
+        np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)
+    ) ** 2
+    loss = (
+        np.sum(residuals ** 2)
+        + lambda_s * np.sum(s ** 2)
+        + lognorm_penalty
+        + lambda_kappa * np.sum(kappa)
+    )
+
+    K_eff = scalar_K * K + np.diag(kappa)
+    sens_records = []
+    for k, f_k in enumerate(cluster_f):
+        f_k = np.ravel(f_k)
+        x_k = x_list[k]
+        U_k = integrate_all_sensitivities_rk4(
+            t_span, x_k, K_eff, K, f_k, param_type="globals"
+        )
+        u_sk = U_k[:, 0, :]
+        u_kappa = [U_k[:, b + 1, :] for b in range(n_biomarkers)]
+        sens_records.append((x_k, u_sk, u_kappa))
+
+    grad_s = 2.0 * lambda_s * s.copy()
+    grad_kappa = np.zeros(n_biomarkers)
+    grad_scalar_K = 0.0
+
+    for k, (x_k, u_sk, u_kappa) in enumerate(sens_records):
+        mask_k = observation_assignments == k
+        if not np.any(mask_k):
+            continue
+        t_k = np.clip(t_obs[mask_k], t_span[0], t_span[-1])
+        res_k = residuals[mask_k]
+
+        x_at = interp_sensitivity_at_obs(x_k, t_span, t_k)
+        u_sk_at = interp_sensitivity_at_obs(u_sk, t_span, t_k)
+        grad_s -= 2.0 * np.sum(res_k * x_at, axis=0)
+        grad_scalar_K -= 2.0 * np.sum(res_k * s[None, :] * u_sk_at)
+
+        for b in range(n_biomarkers):
+            u_b_at = interp_sensitivity_at_obs(u_kappa[b], t_span, t_k)
+            grad_kappa[b] -= 2.0 * np.sum(res_k * s[None, :] * u_b_at)
+
+    grad_kappa += lambda_kappa * np.sign(kappa)
+
+    grad_scalar_K += lambda_scalar * (
+        (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) / scalar_K_safe
+    )
+    grad = np.concatenate([grad_s, grad_kappa, [grad_scalar_K]])
+    return loss, grad
+
+
 def fit_theta_globals(
     X_obs: np.ndarray,
     dt_obs: np.ndarray,
@@ -187,6 +259,7 @@ def fit_theta_globals(
     method:
         'lbfgs_approx' — L-BFGS-B, jac=False (SciPy finite-difference gradient).
         'lbfgs_exact'  — L-BFGS-B, jac=True, exact sensitivities solved with LSODA.
+        'lbfgs_rk4'    — L-BFGS-B, jac=True, sensitivities via RK4 on t_span.
         'nelder_mead'  — derivative-free, loss only.
     """
     t_pred = dt_obs + beta_pred[ids]
@@ -209,6 +282,8 @@ def fit_theta_globals(
 
     if method == "lbfgs_exact":
         loss_fn, scipy_method, use_jac = theta_s_loss_jac_exact_multi, "L-BFGS-B", True
+    elif method == "lbfgs_rk4":
+        loss_fn, scipy_method, use_jac = theta_s_loss_jac_rk4_multi, "L-BFGS-B", True
     elif method == "lbfgs_approx":
         loss_fn, scipy_method, use_jac = theta_s_loss_multi, "L-BFGS-B", False
     elif method == "nelder_mead":
@@ -216,7 +291,7 @@ def fit_theta_globals(
     else:
         raise ValueError(
             f"Unknown method={method!r}; use "
-            "'lbfgs_approx', 'lbfgs_exact', or 'nelder_mead'."
+            "'lbfgs_approx', 'lbfgs_exact', 'lbfgs_rk4', or 'nelder_mead'."
         )
 
     args = (
