@@ -11,7 +11,7 @@ from .optimizer_beta import reconstruction_sse
 from .utils import solve_system
 
 
-def precompute_trajectories(cluster_f, K, t_span, scalar_K, kappa):
+def precompute_trajectories(cluster_f, K, t_span, scalar_K, kappa, ode_method="LSODA"):
     """
     Solve the ODE once per subtype.
 
@@ -23,7 +23,10 @@ def precompute_trajectories(cluster_f, K, t_span, scalar_K, kappa):
     n_biomarkers = np.ravel(cluster_f[0]).shape[0]
     x0 = np.zeros(n_biomarkers)
     return [
-        solve_system(x0, np.ravel(cluster_f[z]), K, t_span, scalar_K, kappa)
+        solve_system(
+            x0, np.ravel(cluster_f[z]), K, t_span, scalar_K, kappa,
+            ode_method=ode_method,
+        )
         for z in range(len(cluster_f))
     ]
 
@@ -106,9 +109,12 @@ def update_assignments_hard(
     cluster_cog_a,
     cluster_cog_b,
     lambda_cog,
+    ode_method="LSODA",
 ):
     """Hard E-step: assign each patient to the subtype with minimum SSE."""
-    X_preds = precompute_trajectories(cluster_f, K, t_span, scalar_K, kappa)
+    X_preds = precompute_trajectories(
+        cluster_f, K, t_span, scalar_K, kappa, ode_method=ode_method
+    )
     sse = sse_matrix(
         X_obs, dt, ids, beta, X_preds, s, t_span,
         cog=cog, cluster_cog_a=cluster_cog_a, cluster_cog_b=cluster_cog_b,
@@ -134,6 +140,7 @@ def update_assignments_jitter(
     lambda_cog,
     temperature=1.0,
     rng=None,
+    ode_method="LSODA",
 ):
     """
     Sample assignments from softmax(-SSE / temperature).
@@ -149,7 +156,9 @@ def update_assignments_jitter(
     assignments = np.zeros(n_patients, dtype=int)
     probabilities = np.zeros((n_patients, n_subtypes))
 
-    X_preds = precompute_trajectories(cluster_f, K, t_span, scalar_K, kappa)
+    X_preds = precompute_trajectories(
+        cluster_f, K, t_span, scalar_K, kappa, ode_method=ode_method
+    )
 
     for p_idx, pid in enumerate(unique_ids):
         mask = ids == pid

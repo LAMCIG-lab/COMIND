@@ -150,6 +150,8 @@ def estimate_beta(
     jsd_bandwidth: float = None,
     jsd_value_range: tuple = None,
     kappa: np.ndarray = None,
+    strict_tol: bool = False,
+    ode_method: str = "LSODA",
 ) -> tuple:
     """Optimize all patient betas jointly with precomputed subtype trajectories."""
     unique_ids = np.unique(ids)
@@ -172,7 +174,10 @@ def estimate_beta(
 
     for subtype in range(len(cluster_f)):
         f_cluster = np.ravel(cluster_f[subtype])
-        x_k = solve_system(np.zeros(n_biomarkers), f_cluster, K, t_span, scalar_K, kappa)
+        x_k = solve_system(
+            np.zeros(n_biomarkers), f_cluster, K, t_span, scalar_K, kappa,
+            ode_method=ode_method,
+        )
         X_pred_by_cluster[subtype] = x_k
         Kx_plus_f = K_eff @ x_k + f_cluster[:, None]
         dxdt_by_cluster[subtype] = (1.0 - x_k) * Kx_plus_f
@@ -205,13 +210,17 @@ def estimate_beta(
             beta_var,
         )
 
+    lbfgs_options = {"maxiter": 100}
+    if strict_tol:
+        lbfgs_options.update({"ftol": 2.2e-10, "gtol": 1e-6})
+
     result = minimize(
         loss_and_grad,
         x0=beta_all.copy(),
         method="L-BFGS-B",
         jac=True,
         bounds=[(0, t_max)] * n_patients,
-        options={"maxiter": 100},
+        options=lbfgs_options,
     )
     optimized_beta = result.x
 

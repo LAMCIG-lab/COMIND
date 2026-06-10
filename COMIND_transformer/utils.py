@@ -5,7 +5,15 @@ from scipy.optimize import linear_sum_assignment
 import statsmodels.formula.api as smf
 from typing import Sequence
 
-def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarray, scalar_K: float = 1.0, kappa: np.ndarray = None) -> np.ndarray:
+def solve_system(
+    x0: np.ndarray,
+    f: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    scalar_K: float = 1.0,
+    kappa: np.ndarray = None,
+    ode_method: str = "LSODA",
+) -> np.ndarray:
     """
     Solves the multivariate logistic ODE system given initial conditions and parameters.
 
@@ -31,7 +39,14 @@ def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarra
     if kappa is None:
         kappa = np.zeros(K.shape[0])
     K_eff = scalar_K * K + np.diag(kappa)
-    
+
+    if ode_method == "BDF":
+        K_sparsity = (np.abs(K_eff) > 0).astype(int)
+        K_sparsity[np.arange(K.shape[0]), np.arange(K.shape[0])] = 1
+        jac_sparsity_arg = K_sparsity
+    else:
+        jac_sparsity_arg = None
+
     def ode_system(t, x):
         # x = np.clip(x, 0.0 + eps, 1.0 - eps)  # prevent overshoot near upper bound
         # K_eff already includes scalar_K: K_eff = scalar_K * K + diag(kappa)
@@ -63,11 +78,9 @@ def solve_system(x0: np.ndarray, f: np.ndarray, K: np.ndarray, t_span: np.ndarra
         [t_span[0], t_span[-1]],
         x0,
         t_eval=t_span,
-        method="LSODA",
+        method=ode_method,
         jac=jacobian_ode,
-        # rtol=1e-8,#1e-6,
-        # atol=1e-10,#1e-8
-        # reminder: LSODA ignores min and max step
+        jac_sparsity=jac_sparsity_arg,
     )
 
 

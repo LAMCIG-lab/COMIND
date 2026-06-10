@@ -35,13 +35,14 @@ def theta_cluster_loss(
     scalar_K: float,
     lambda_f: float,
     kappa: np.ndarray = None,
+    ode_method: str = "LSODA",
 ) -> float:
     """Loss for cluster-level f with fixed global s and scalar_K."""
     n_biomarkers = x_obs.shape[1]
     f = params
     x0 = np.zeros(n_biomarkers)
 
-    x = solve_system(x0, f, K, t_span, scalar_K, kappa)
+    x = solve_system(x0, f, K, t_span, scalar_K, kappa, ode_method=ode_method)
     x_scaled = s[:, None] * x
 
     t_obs_clamped = np.clip(t_obs, t_span[0], t_span[-1])
@@ -63,13 +64,14 @@ def theta_cluster_loss_jac(
     scalar_K: float,
     lambda_f: float,
     kappa: np.ndarray = None,
+    ode_method: str = "LSODA",
 ) -> tuple:
     """Loss and approximate gradient for cluster-level f (cumulative_simpson)."""
     n_biomarkers = x_obs.shape[1]
     f = params
     x0 = np.zeros(n_biomarkers)
 
-    x = solve_system(x0, f, K, t_span, scalar_K, kappa)
+    x = solve_system(x0, f, K, t_span, scalar_K, kappa, ode_method=ode_method)
     x_scaled = s[:, None] * x
 
     t_obs_clamped = np.clip(t_obs, t_span[0], t_span[-1])
@@ -109,6 +111,7 @@ def theta_cluster_loss_jac_exact(
     scalar_K: float,
     lambda_f: float,
     kappa: np.ndarray = None,
+    ode_method: str = "LSODA",
 ) -> tuple:
     """Loss and gradient w.r.t. f using exact sensitivities solved with LSODA."""
     n_biomarkers = x_obs.shape[1]
@@ -118,7 +121,7 @@ def theta_cluster_loss_jac_exact(
         kappa = np.zeros(n_biomarkers)
     K_eff = scalar_K * K + np.diag(kappa)
 
-    x = solve_system(x0, f, K, t_span, scalar_K, kappa)
+    x = solve_system(x0, f, K, t_span, scalar_K, kappa, ode_method=ode_method)
     x_scaled = s[:, None] * x
     t_obs_clamped = np.clip(t_obs, t_span[0], t_span[-1])
     x_pred = np.zeros_like(x_obs)
@@ -147,6 +150,7 @@ def theta_cluster_loss_jac_rk4(
     scalar_K: float,
     lambda_f: float,
     kappa: np.ndarray = None,
+    ode_method: str = "LSODA",
 ) -> tuple:
     """Loss and gradient w.r.t. f using RK4 sensitivities on t_span."""
     n_biomarkers = x_obs.shape[1]
@@ -156,7 +160,7 @@ def theta_cluster_loss_jac_rk4(
         kappa = np.zeros(n_biomarkers)
     K_eff = scalar_K * K + np.diag(kappa)
 
-    x = solve_system(x0, f, K, t_span, scalar_K, kappa)
+    x = solve_system(x0, f, K, t_span, scalar_K, kappa, ode_method=ode_method)
     x_scaled = s[:, None] * x
     t_obs_clamped = np.clip(t_obs, t_span[0], t_span[-1])
     x_pred = np.zeros_like(x_obs)
@@ -192,6 +196,8 @@ def fit_theta_cluster(
     rng: np.random.Generator = None,
     kappa: np.ndarray = None,
     method: str = "lbfgs_approx",
+    strict_tol: bool = False,
+    ode_method: str = "LSODA",
 ) -> np.ndarray:
     """
     Optimizes cluster-level f for patients in a specific cluster.
@@ -227,15 +233,23 @@ def fit_theta_cluster(
             "'lbfgs_approx', 'lbfgs_exact', 'lbfgs_rk4', or 'nelder_mead'."
         )
 
-    args = (t_pred, X_obs, K, t_span, s, scalar_K, lambda_f, kappa)
+    args = (t_pred, X_obs, K, t_span, s, scalar_K, lambda_f, kappa, ode_method)
 
-    result = minimize(
-        loss_fn,
-        f_guess,
+    minimize_kwargs = dict(
+        fun=loss_fn,
+        x0=f_guess,
         args=args,
         method=scipy_method,
         jac=use_jac,
         bounds=bounds,
     )
+    if scipy_method == "L-BFGS-B" and strict_tol:
+        minimize_kwargs["options"] = {
+            "maxiter": 200,
+            "ftol": 2.2e-10,
+            "gtol": 1e-6,
+        }
+
+    result = minimize(**minimize_kwargs)
 
     return result.x

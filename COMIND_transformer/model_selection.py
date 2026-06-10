@@ -82,6 +82,7 @@ def compute_sse_per_biomarker(
     kappa,
     K,
     t_span,
+    ode_method="LSODA",
 ):
     """
     Sum of squared errors per biomarker on training data.
@@ -95,7 +96,10 @@ def compute_sse_per_biomarker(
     sse_per_b = np.zeros(n_biomarkers)
     x0 = np.zeros(n_biomarkers)
     X_pred_by_cluster = [
-        solve_system(x0, np.ravel(cluster_f[subtype]), K, t_span, scalar_K, kappa)
+        solve_system(
+            x0, np.ravel(cluster_f[subtype]), K, t_span, scalar_K, kappa,
+            ode_method=ode_method,
+        )
         for subtype in range(n_subtypes)
     ]
     for r in range(X_obs.shape[0]):

@@ -109,6 +109,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         jitter_temperature: float = 1.0,
         verbose: int = 1,
         n_beta_grid: int = 20,
+        strict_tol: bool = False,
+        ode_method: str = "LSODA",
+        n_anneal_iters: int = 0,
+        kappa_anneal_strength: float = 0.05,
+        f_anneal_strength: float = 0.01,
+        anneal_decay: float = 0.7,
     ):
         self.max_iter = max_iter
         self.t_max = t_max
@@ -147,6 +153,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
         self.verbose = verbose
         self.n_beta_grid = n_beta_grid
+        self.strict_tol = strict_tol
+        self.ode_method = ode_method
+        self.n_anneal_iters = n_anneal_iters
+        self.kappa_anneal_strength = kappa_anneal_strength
+        self.f_anneal_strength = f_anneal_strength
+        self.anneal_decay = anneal_decay
 
     def fit(self, X: list, y=None, checkpoint_path=None):
         """
@@ -198,6 +210,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 self.t_span,
                 self.final_scalar_K,
                 self.final_kappa,
+                ode_method=self.ode_method,
             )
             for z in range(self.n_subtypes)
         ]
@@ -415,7 +428,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
         beta = flat["initial_beta"]
         X_preds = precompute_trajectories(
-            cluster_f, self.K, self.t_span, scalar_K, kappa
+            cluster_f, self.K, self.t_span, scalar_K, kappa,
+            ode_method=self.ode_method,
         )
         sse_mat = sse_matrix(
             flat["X_obs"],
@@ -480,6 +494,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             best_lse=np.inf,
             loop_iter=0,
             final_lse=initial_lse,
+            n_biomarkers=n_biomarkers,
         )
 
     def _run_em_loop(self, state, flat, X):
@@ -555,6 +570,22 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             state["final_lse"] = lse
             state["loop_iter"] += 1
             pbar.update(1)
+            if self.n_anneal_iters > 0 and state["loop_iter"] <= self.n_anneal_iters:
+                decay = self.anneal_decay ** (state["loop_iter"] - 1)
+                kappa_noise = self.rng.uniform(
+                    0, self.kappa_anneal_strength * decay,
+                    size=state["current_kappa"].shape,
+                )
+                state["current_kappa"] = state["current_kappa"] + kappa_noise
+                for z in range(self.n_subtypes):
+                    f_scale = 1.0 + self.rng.uniform(
+                        -self.f_anneal_strength * decay,
+                        self.f_anneal_strength * decay,
+                        size=state["cluster_f"][z].shape,
+                    )
+                    state["cluster_f"][z] = np.maximum(
+                        state["cluster_f"][z] * f_scale, 0.0
+                    )
             self._save_fit_checkpoint(state, flat, X, fit_complete=False)
 
     def _em_step(self, state, flat, current_solver):
@@ -582,6 +613,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 lambda_kappa=self.lambda_kappa,
                 assignments=state["assignments"],
                 cluster_f=state["cluster_f"],
+                strict_tol=self.strict_tol,
+                ode_method=self.ode_method,
             )
         )
 
@@ -610,6 +643,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 self.lambda_cog,
                 temperature=self.jitter_temperature,
                 rng=self.rng,
+                ode_method=self.ode_method,
             )
             self.assignment_probabilities_ = probs
         else:
@@ -628,6 +662,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 state["cluster_cog_a"],
                 state["cluster_cog_b"],
                 self.lambda_cog,
+                ode_method=self.ode_method,
             )
 
         for z in range(self.n_subtypes):
@@ -671,6 +706,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     f_guess=np.ravel(state["cluster_f"][z]),
                     rng=self.rng,
                     kappa=state["current_kappa"],
+                    strict_tol=self.strict_tol,
+                    ode_method=self.ode_method,
                 )
             )
 
@@ -695,6 +732,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             beta_var=state["beta_var"],
             t_max=self.t_max,
             kappa=state["current_kappa"],
+            strict_tol=self.strict_tol,
+            ode_method=self.ode_method,
         )
 
         return lse
@@ -761,6 +800,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.t_span,
             state["current_scalar_K"],
             self.final_kappa,
+            ode_method=self.ode_method,
         )
 
         self.n_obs_ = flat["n_obs"]
@@ -778,6 +818,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             state["current_kappa"],
             self.K,
             self.t_span,
+            ode_method=self.ode_method,
         )
         k = count_bic_params(
             self.final_s,
