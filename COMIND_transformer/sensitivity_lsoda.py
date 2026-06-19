@@ -134,8 +134,7 @@ def integrate_all_sensitivities_lsoda(
     def forcing_matrix(x: np.ndarray) -> np.ndarray:
         B = np.zeros((n, n_params), dtype=float)
         B[:, 0] = (1.0 - x) * (K @ x)
-        for b in range(n):
-            B[b, b + 1] = (1.0 - x[b]) * x[b]
+        np.fill_diagonal(B[:, 1:], (1.0 - x) * x)
         return B
 
     def rhs(t: float, u_flat: np.ndarray) -> np.ndarray:
@@ -145,17 +144,11 @@ def integrate_all_sensitivities_lsoda(
         dU = A @ U + forcing_matrix(x)
         return dU.ravel(order="F")
 
-    def jac(t: float, u_flat: np.ndarray) -> np.ndarray:
-        x = np.asarray(x_fn(t), dtype=float)
-        A = _ode_jacobian(x, K_eff, f)
-        return np.kron(np.eye(n_params), A)
-
     sol = solve_ivp(
         rhs,
         [float(t_span[0]), float(t_span[-1])],
         np.zeros(n * n_params, dtype=float),
         method="LSODA",
-        jac=jac,
         t_eval=t_span,
     )
     return sol.y.reshape(n, n_params, m, order="F")
@@ -203,17 +196,18 @@ def integrate_f_sensitivities_lsoda(
         dU = A @ U + forcing_matrix(x)
         return dU.ravel(order="F")
 
-    def jac(t: float, u_flat: np.ndarray) -> np.ndarray:
-        x = np.asarray(x_fn(t), dtype=float)
-        A = _ode_jacobian(x, K_eff, f)
-        return np.kron(np.eye(n_params), A)
+    # 06/16/2026 jac might be using too much memory bottlenecking speed
+
+    # def jac(t: float, u_flat: np.ndarray) -> np.ndarray:
+    #     x = np.asarray(x_fn(t), dtype=float)
+    #     A = _ode_jacobian(x, K_eff, f)
+    #     return np.kron(np.eye(n_params), A)
 
     sol = solve_ivp(
         rhs,
         [float(t_span[0]), float(t_span[-1])],
         np.zeros(n * n_params, dtype=float),
         method="LSODA",
-        jac=jac,
         t_eval=t_span,
     )
     return sol.y.reshape(n, n_params, m, order="F")

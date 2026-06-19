@@ -80,26 +80,23 @@ def integrate_all_sensitivities_rk4(
     A_all = _precompute_A_all(x_traj, K_eff, f)
     B_all = _precompute_B_all(x_traj, K, param_type)
 
-    A_mid = 0.5 * (A_all[:-1] + A_all[1:])
-    B_mid = 0.5 * (B_all[:-1] + B_all[1:])
-
     U = np.zeros((n, n_params))
-    U_traj = np.zeros((n, n_params, T))
+    U_traj = np.zeros((T, n, n_params))
 
     for i in range(T - 1):
         dt = t_span[i + 1] - t_span[i]
         Ai = A_all[i]
-        Amid = A_mid[i]
         Ai1 = A_all[i + 1]
         Bi = B_all[i]
-        Bmid = B_mid[i]
         Bi1 = B_all[i + 1]
+        Amid = 0.5 * (Ai + Ai1)
+        Bmid = 0.5 * (Bi + Bi1)
 
         k1 = Ai @ U + Bi
         k2 = Amid @ (U + 0.5 * dt * k1) + Bmid
         k3 = Amid @ (U + 0.5 * dt * k2) + Bmid
         k4 = Ai1 @ (U + dt * k3) + Bi1
         U = U + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-        U_traj[:, :, i + 1] = U
+        U_traj[i + 1] = U
 
-    return U_traj
+    return np.moveaxis(U_traj, 0, -1)

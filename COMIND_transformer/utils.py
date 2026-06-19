@@ -39,6 +39,7 @@ def solve_system(
     if kappa is None:
         kappa = np.zeros(K.shape[0])
     K_eff = scalar_K * K + np.diag(kappa)
+    diag_K_eff = np.diag(K_eff)
 
     if ode_method == "BDF":
         K_sparsity = (np.abs(K_eff) > 0).astype(int)
@@ -50,39 +51,32 @@ def solve_system(
     def ode_system(t, x):
         # x = np.clip(x, 0.0 + eps, 1.0 - eps)  # prevent overshoot near upper bound
         # K_eff already includes scalar_K: K_eff = scalar_K * K + diag(kappa)
-        dxdt =  (np.eye(K.shape[0]) - np.diag(x)) @ ((K_eff @ x) + f)
-        return dxdt 
-    # def jacobian_ode(t, x):
-    #     J = (1 - x)[:, None] * K
-    #     J[np.diag_indices_from(J)] = -((K @ x) + f)
-    #     return J
-    
-    # check parent function declaration for attributes
-    # def jacobian_ode(t, x, alpha = alpha) -> np.ndarray: # returns matrix
-    #     J = (1 - x)[:, None] * (alpha * K) # for non-diag
-    #     Kx_plus_f = alpha * (K @ x) + f # diagonal entries
-    #     J[np.diag_indices_from(J)] = -Kx_plus_f
-    #     return J
-    
+        dxdt = (1.0 - x) * (K_eff @ x + f)
+        return dxdt
+
     def jacobian_ode(t, x):
         # dx_i/dt = (1 - x_i) * ((K_eff @ x)_i + f_i)
         # J_ij = (1 - x_i) * K_eff[i,j]  for i != j
         # J_ii = (1 - x_i) * K_eff[i,i] - ((K_eff @ x)_i + f_i)
         g = (K_eff @ x) + f
         J = (1 - x)[:, None] * K_eff
-        J[np.diag_indices_from(J)] = (1 - x) * np.diag(K_eff) - g
-        return J    
+        J[np.diag_indices_from(J)] = (1.0 - x) * diag_K_eff - g
+        return J
+
+    ivp_kwargs = dict(
+        t_eval=t_span,
+        method=ode_method,
+        jac=jacobian_ode,
+    )
+    if jac_sparsity_arg is not None:
+        ivp_kwargs["jac_sparsity"] = jac_sparsity_arg
 
     sol = solve_ivp(
         ode_system,
         [t_span[0], t_span[-1]],
         x0,
-        t_eval=t_span,
-        method=ode_method,
-        jac=jacobian_ode,
-        jac_sparsity=jac_sparsity_arg,
+        **ivp_kwargs,
     )
-
 
     return sol.y
 
