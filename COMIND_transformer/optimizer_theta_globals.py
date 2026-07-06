@@ -7,7 +7,7 @@ from .sensitivity_lsoda import (
 )
 from .sensitivity_rk4 import integrate_all_sensitivities_rk4
 
-# Log-normal prior center for scalar_K (penalty pulls toward this value)
+# Log-normal prior center for scalar_K (penalty pulls toward this value in real space)
 SCALAR_K_CENTER = 0.25
 # Lower bound for scalar_K in log-normal penalty/gradient to avoid log(0) and divide-by-zero
 SCALAR_K_MIN = 1e-12
@@ -25,6 +25,22 @@ def _pseudo_huber_grad(values: np.ndarray, delta: float = SPARSE_PSEUDO_HUBER_DE
     """Gradient of summed pseudo-Huber penalty w.r.t. values."""
     values = np.asarray(values, dtype=float)
     return values / np.sqrt(1.0 + (values / delta) ** 2)
+
+
+def _lognorm_scalar_K_penalty(
+    scalar_K_safe: float, lambda_scalar: float, scalar_K_center: float
+) -> float:
+    return 0.5 * lambda_scalar * (
+        np.log(scalar_K_safe) - np.log(scalar_K_center)
+    ) ** 2
+
+
+def _lognorm_scalar_K_grad(
+    scalar_K_safe: float, lambda_scalar: float, scalar_K_center: float
+) -> float:
+    return lambda_scalar * (
+        (np.log(scalar_K_safe) - np.log(scalar_K_center)) / scalar_K_safe
+    )
 
 
 def _solve_and_residuals(
@@ -78,6 +94,7 @@ def theta_s_loss_multi(
     lambda_s: float = 0.0,
     lambda_scalar: float = 0.0,
     lambda_kappa: float = 0.0,
+    scalar_K_center: float = SCALAR_K_CENTER,
     ode_method: str = "LSODA",
 ) -> float:
     """
@@ -89,9 +106,9 @@ def theta_s_loss_multi(
         ode_method=ode_method,
     )
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
-    lognorm_penalty = 0.5 * lambda_scalar * (
-        np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)
-    ) ** 2
+    lognorm_penalty = _lognorm_scalar_K_penalty(
+        scalar_K_safe, lambda_scalar, scalar_K_center
+    )
     return (
         np.sum(residuals ** 2)
         + lambda_s * np.sum(s ** 2)
@@ -111,6 +128,7 @@ def theta_s_loss_jac_exact_multi(
     lambda_s: float = 0.0,
     lambda_scalar: float = 0.0,
     lambda_kappa: float = 0.0,
+    scalar_K_center: float = SCALAR_K_CENTER,
     ode_method: str = "LSODA",
 ) -> tuple:
     """
@@ -123,9 +141,9 @@ def theta_s_loss_jac_exact_multi(
     )
     n_biomarkers = x_obs.shape[1]
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
-    lognorm_penalty = 0.5 * lambda_scalar * (
-        np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)
-    ) ** 2
+    lognorm_penalty = _lognorm_scalar_K_penalty(
+        scalar_K_safe, lambda_scalar, scalar_K_center
+    )
     loss = (
         np.sum(residuals ** 2)
         + lambda_s * np.sum(s ** 2)
@@ -165,8 +183,8 @@ def theta_s_loss_jac_exact_multi(
 
     grad_kappa += lambda_kappa * np.sign(kappa)
 
-    grad_scalar_K += lambda_scalar * (
-        (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) / scalar_K_safe
+    grad_scalar_K += _lognorm_scalar_K_grad(
+        scalar_K_safe, lambda_scalar, scalar_K_center
     )
     grad = np.concatenate([grad_s, grad_kappa, [grad_scalar_K]])
     return loss, grad
@@ -183,6 +201,7 @@ def theta_s_loss_jac_rk4_multi(
     lambda_s: float = 0.0,
     lambda_scalar: float = 0.0,
     lambda_kappa: float = 0.0,
+    scalar_K_center: float = SCALAR_K_CENTER,
     ode_method: str = "LSODA",
 ) -> tuple:
     """
@@ -194,9 +213,9 @@ def theta_s_loss_jac_rk4_multi(
     )
     n_biomarkers = x_obs.shape[1]
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
-    lognorm_penalty = 0.5 * lambda_scalar * (
-        np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)
-    ) ** 2
+    lognorm_penalty = _lognorm_scalar_K_penalty(
+        scalar_K_safe, lambda_scalar, scalar_K_center
+    )
     loss = (
         np.sum(residuals ** 2)
         + lambda_s * np.sum(s ** 2)
@@ -238,8 +257,8 @@ def theta_s_loss_jac_rk4_multi(
 
     grad_kappa += lambda_kappa * np.sign(kappa)
 
-    grad_scalar_K += lambda_scalar * (
-        (np.log(scalar_K_safe) - np.log(SCALAR_K_CENTER)) / scalar_K_safe
+    grad_scalar_K += _lognorm_scalar_K_grad(
+        scalar_K_safe, lambda_scalar, scalar_K_center
     )
     grad = np.concatenate([grad_s, grad_kappa, [grad_scalar_K]])
     return loss, grad
@@ -260,6 +279,7 @@ def fit_theta_globals(
     lambda_s: float = 0.0,
     lambda_scalar: float = 0.0,
     lambda_kappa: float = 0.0,
+    scalar_K_center: float = SCALAR_K_CENTER,
     method: str = "lbfgs_approx",
     strict_tol: bool = False,
     ode_method: str = "LSODA",
@@ -315,6 +335,7 @@ def fit_theta_globals(
         lambda_s,
         lambda_scalar,
         lambda_kappa,
+        scalar_K_center,
         ode_method,
     )
 

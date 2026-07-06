@@ -49,15 +49,15 @@ def solve_system(
         jac_sparsity_arg = None
 
     def ode_system(t, x):
-        # x = np.clip(x, 0.0 + eps, 1.0 - eps)  # prevent overshoot near upper bound
-        # K_eff already includes scalar_K: K_eff = scalar_K * K + diag(kappa)
+        # Logistic state must stay in [0, 1); clip to avoid blow-up in K_eff @ x.
+        eps = 1e-9
+        x = np.clip(x, 0.0, 1.0 - eps)
         dxdt = (1.0 - x) * (K_eff @ x + f)
         return dxdt
 
     def jacobian_ode(t, x):
-        # dx_i/dt = (1 - x_i) * ((K_eff @ x)_i + f_i)
-        # J_ij = (1 - x_i) * K_eff[i,j]  for i != j
-        # J_ii = (1 - x_i) * K_eff[i,i] - ((K_eff @ x)_i + f_i)
+        eps = 1e-9
+        x = np.clip(x, 0.0, 1.0 - eps)
         g = (K_eff @ x) + f
         J = (1 - x)[:, None] * K_eff
         J[np.diag_indices_from(J)] = (1.0 - x) * diag_K_eff - g
@@ -78,7 +78,24 @@ def solve_system(
         **ivp_kwargs,
     )
 
-    return sol.y
+    y = sol.y
+    if y.shape[1] == len(t_span):
+        return y
+
+    # LSODA can stop early on stiff/unstable trajectories; interpolate onto t_span
+    # so downstream np.interp callers always see len(t_span) points.
+    if not sol.success:
+        import warnings
+        warnings.warn(
+            f"solve_ivp ({ode_method}) did not reach all t_eval points "
+            f"({y.shape[1]}/{len(t_span)}); interpolating onto t_span.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    y_out = np.empty((y.shape[0], len(t_span)), dtype=float)
+    for b in range(y.shape[0]):
+        y_out[b] = np.interp(t_span, sol.t, y[b], left=y[b, 0], right=y[b, -1])
+    return y_out
 
 def initialize_beta(ids: np.ndarray, beta_range: tuple = (0, 12), rng: np.random.Generator = None) -> np.ndarray:
     """

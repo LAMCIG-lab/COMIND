@@ -89,6 +89,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         lambda_f: float = 0.01,
         lambda_cog: float = 0,
         lambda_scalar: float = 0.0,
+        scalar_K_center: float = 0.25,
         lambda_jsd: float = 0.0,
         lambda_beta: float = 0.0,
         lambda_kappa: float = 0.0,
@@ -125,6 +126,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.lambda_f = lambda_f
         self.lambda_cog = lambda_cog
         self.lambda_scalar = lambda_scalar
+        self.scalar_K_center = scalar_K_center
         self.lambda_jsd = lambda_jsd
         self.lambda_beta = lambda_beta
         self.lambda_kappa = lambda_kappa
@@ -367,7 +369,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         scalar_K = (
             float(self.initial_scalar_K)
             if self.initial_scalar_K is not None
-            else float(np.max(flat["X_obs"]))
+            else 1.0
         )
 
         if self.initial_kappa is not None:
@@ -611,6 +613,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 lambda_s=0.0,
                 lambda_scalar=self.lambda_scalar,
                 lambda_kappa=self.lambda_kappa,
+                scalar_K_center=self.scalar_K_center,
                 assignments=state["assignments"],
                 cluster_f=state["cluster_f"],
                 strict_tol=self.strict_tol,
@@ -942,12 +945,14 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             max_iter=int(self.max_iter),
         )
 
-        tmp_path = path + ".tmp"
+        # np.savez appends ".npz"; use a .tmp stem so the temp file is <path>.tmp.npz
+        tmp_base = (path[:-4] + ".tmp") if path.endswith(".npz") else (path + ".tmp")
+        tmp_npz = tmp_base + ".npz"
         out_dir = os.path.dirname(path)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-        np.savez(tmp_path, **payload)
-        os.replace(tmp_path, path)
+        np.savez(tmp_base, **payload)
+        os.replace(tmp_npz, path)
         if self.verbose >= 1:
             tag = "complete" if fit_complete else "progress"
             print(

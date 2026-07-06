@@ -21,4 +21,6 @@ env/
 # Data
 experiments/
 notebooks/PPMI_with_beta_subtype_split.csv
+notebooks/ppmi_filter.ipynb
 *.csv
+notebooks/ppmi_filter_2.ipynb
