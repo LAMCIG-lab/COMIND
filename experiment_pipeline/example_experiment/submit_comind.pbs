@@ -1,0 +1,39 @@
+#!/bin/bash
+#PBS -N example_experiment
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=04:00:00
+#PBS -l mem=2gb
+#PBS -j oe
+#PBS -m a
+#PBS -o /path/to/experiment_pipeline/example_experiment/logs
+#PBS -t 0-323%60
+#
+# Default CONFIG in run_comind.py yields:
+#   lambda_f[3] x lambda_kappa[3] x lambda_cog[1] x lambda_scalar[2]
+#   x scalar_K_center[3] x lambda_jsd[2] x lambda_beta[1]
+#   = 108 hyper combos x n_subtypes_list[3] = 324 candidates  ->  -t 0-323
+# If you change the CONFIG grid, recompute:
+#   (product of len(each param list)) * len(n_subtypes_list) - 1
+# or run once locally (PBS_ARRAYID unset -> candidate 0) and copy the printed
+# "total candidates" count. %60 caps concurrent array tasks.
+
+set -eo pipefail
+
+EXP_DIR="/path/to/experiment_pipeline/example_experiment"
+cd "$EXP_DIR"
+mkdir -p logs results
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate YOUR_ENV
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+# If COMIND is not installed in YOUR_ENV, also set:
+# export PYTHONPATH="/path/to/COMIND${PYTHONPATH:+:${PYTHONPATH}}"
+
+echo "PBS_JOBID=${PBS_JOBID:-}"
+echo "PBS_ARRAYID=${PBS_ARRAYID:-0}"
+
+python "${EXP_DIR}/run_comind.py"

@@ -24,3 +24,7 @@ notebooks/PPMI_with_beta_subtype_split.csv
 notebooks/ppmi_filter.ipynb
 *.csv
 notebooks/ppmi_filter_2.ipynb
+
+# Experiment array outputs (keep templates; ignore run artifacts)
+experiment_pipeline/**/results/
+experiment_pipeline/**/logs/
