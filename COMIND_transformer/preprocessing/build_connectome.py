@@ -76,3 +76,16 @@ def build_connectome(
               f"{unused}")
 
     return K, missing
+
+
+# K, disconnected = build_connectome(
+#     "connectome.csv",
+#     X_cols=["putamen_left", "putamen_right", "MCATOT"],
+#     x_to_k={
+#         "putamen_left": "Left-Putamen",
+#         "putamen_right": "Right-Putamen",
+#         # MCATOT omitted not in connectome, and there's no map for it,
+#         # so it auto-pads as a disconnected node (needs pad_missing=True)
+#     },
+#     pad_missing=True,
+# )

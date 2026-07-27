@@ -10,6 +10,7 @@ folder only runs `parse_data` → `build_connectome` → `SubtypingEM`.
 |------|------|
 | `run_comind.py` | Edit the CONFIG block; run one grid candidate |
 | `submit_comind.pbs` | Torque/PBS array wrapper |
+| `analyze_results.ipynb` | BIC-sorted candidate table + load best run / clean CSV |
 
 Outputs go under `results/` and PBS stdout under `logs/` (both gitignored).
 
@@ -58,3 +59,13 @@ PBS_ARRAYID=0 python run_comind.py
 ```
 
 Uses placeholder paths until you point CONFIG at real files — expect a file-not-found until then.
+
+## After the grid: `analyze_results.ipynb`
+
+Keep analysis thin:
+
+1. **Results table only** — scan `result_*.npz` for BIC / LSE / hypers (no CSV needed).
+2. **Load one candidate** — fitted params + saved `train_ids` / `val_ids`.
+3. **Optional cohort reload** — `pd.read_csv(csv_path)` + `parse_data` using paths stored in the npz.
+
+Do **not** re-run `train_test_split` in the notebook. Prefer the saved id lists. `split_seed` / `test_size` are stored for provenance / reproducing the driver, not for re-deriving membership after the fact.

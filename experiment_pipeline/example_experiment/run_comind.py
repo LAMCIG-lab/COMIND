@@ -87,20 +87,20 @@ all_patients = parse_data(
 n_biomarkers = len(X_COLS)
 print(f"Patients: {len(all_patients)}, biomarkers: {n_biomarkers}")
 
-# --- 3. Connectome ---
+# 3. Connectome 
 K, disconnected = build_connectome(CONNECTOME_PATH, X_COLS, pad_missing=True)
 assert K.shape == (n_biomarkers, n_biomarkers)
 print(f"K aligned: {K.shape}, {len(disconnected)} disconnected: {disconnected}")
 
 f_init = np.random.RandomState(SPLIT_SEED).uniform(0.05, 0.15, size=n_biomarkers)
 
-# --- 4. Train/val split -- completely random, not longitudinal-based ---
+# 4. Train/val split    
 X_train, X_val = train_test_split(
     all_patients, test_size=TEST_SIZE, random_state=SPLIT_SEED
 )
 print(f"Train: {len(X_train)} patients, Val: {len(X_val)} patients")
 
-# --- 5. Build the grid ---
+# 5. Build the grid
 N_SUBTYPES_LIST = list(EXPERIMENT_CONFIG["n_subtypes_list"])
 param_grid_hyper = dict(EXPERIMENT_CONFIG["param_grid_hyper"])
 hyper_names = list(param_grid_hyper.keys())
@@ -125,7 +125,7 @@ print(f"\n=== Candidate {current_candidate} (n_subtypes={n_subtypes}) ===")
 for name, value in params.items():
     print(f"  {name}: {value}")
 
-# --- 6. Fit ---
+# 6. Fit
 subtyping_em = SubtypingEM(
     K=K,
     initial_f=f_init,
@@ -155,7 +155,7 @@ beta_val = transform_results["beta"]
 val_assignments = transform_results["subtype"]
 val_lse = subtyping_em._compute_val_score(X_val, beta_val)
 
-# --- 7. Save literally everything ---
+# 7. Save literally everything
 bic_value = subtyping_em.bic_
 lse_final = float(subtyping_em.lse_final)
 n_obs = int(subtyping_em.n_obs_)
@@ -202,6 +202,17 @@ np.savez(
     val_lse=val_lse,
     train_ids=np.array([p["id"] for p in X_train], dtype=object),
     val_ids=np.array([p["id"] for p in X_val], dtype=object),
+    # provenance (so analyze_results.ipynb stays dumb)
+    experiment_name=EXPERIMENT_CONFIG["name"],
+    csv_path=CSV_PATH,
+    connectome_path=CONNECTOME_PATH,
+    id_col=ID_COL,
+    time_col=TIME_COL,
+    clinical_cols=np.array(CLINICAL_COLS, dtype=object),
+    metadata_cols=np.array(METADATA_COLS, dtype=object),
+    split_seed=SPLIT_SEED,
+    test_size=TEST_SIZE,
+    t_max=T_MAX,
     # candidate / grid bookkeeping
     candidate=current_candidate,
     k_idx=k_idx,
