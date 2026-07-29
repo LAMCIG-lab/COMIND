@@ -41,7 +41,7 @@ EXPERIMENT_CONFIG = {
     "name": "example_experiment",
     "max_iter": 100,
     "theta_solver_stages": ("lbfgs_approx",), # choose solver type: "lbfgs_approx", "lbfgs_exact", "lbfgs_rk4"
-    "n_subtypes_list": [2, 3, 4],
+    "n_subtypes_list": [1, 2, 3, 4],
     "param_grid_hyper": {
         "lambda_f": [2.0, 10.0, 20.0],
         "lambda_kappa": [0.5, 2.0, 5.0],

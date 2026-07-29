@@ -93,6 +93,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         lambda_jsd: float = 0.0,
         lambda_beta: float = 0.0,
         lambda_kappa: float = 0.0,
+        fit_s: bool = True,
         initial_f: np.ndarray = None,
         initial_s: np.ndarray = None,
         initial_scalar_K: float = None,
@@ -130,6 +131,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.lambda_jsd = lambda_jsd
         self.lambda_beta = lambda_beta
         self.lambda_kappa = lambda_kappa
+        self.fit_s = fit_s
 
         self.initial_f = initial_f
         self.initial_s = initial_s
@@ -614,6 +616,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 lambda_scalar=self.lambda_scalar,
                 lambda_kappa=self.lambda_kappa,
                 scalar_K_center=self.scalar_K_center,
+                fit_s=self.fit_s,
                 assignments=state["assignments"],
                 cluster_f=state["cluster_f"],
                 strict_tol=self.strict_tol,
