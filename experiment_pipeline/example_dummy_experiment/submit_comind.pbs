@@ -1,0 +1,38 @@
+#!/bin/bash
+#PBS -N comind_dummy_demo
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=04:00:00
+#PBS -l mem=2gb
+#PBS -j oe
+#PBS -m a
+#PBS -o /home/dsemchin/COMIND/experiment_pipeline/example_dummy_experiment/logs
+#PBS -t 0-3%4
+#
+# Default CONFIG in run_comind.py yields:
+#   one hyperparameter combination x n_subtypes [1,2,3,4]
+#   = 4 candidates -> -t 0-3
+# If you change the CONFIG grid, recompute:
+#   (product of len(each param list)) * len(n_subtypes_list) - 1
+# or run once locally (PBS_ARRAYID unset -> candidate 0) and copy the printed
+# "total candidates" count.
+
+set -eo pipefail
+
+EXP_DIR="/home/dsemchin/COMIND/experiment_pipeline/example_dummy_experiment"
+COMIND_ROOT="/home/dsemchin/COMIND"
+cd "$EXP_DIR"
+mkdir -p logs results
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate comind
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${COMIND_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+echo "PBS_JOBID=${PBS_JOBID:-}"
+echo "PBS_ARRAYID=${PBS_ARRAYID:-0}"
+
+python "${EXP_DIR}/run_comind.py"
