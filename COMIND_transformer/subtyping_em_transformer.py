@@ -270,6 +270,177 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.transform_assignments = results["subtype"]
         return results
 
+    def transform_soft(
+        self,
+        X: list,
+        use_cognitive_prior: bool = True,
+        temperature: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Per-patient beta under each subtype, plus softmax probabilities from LSE.
+
+        For every patient and subtype ``z``:
+          1. Grid-search beta for that fixed subtype
+          2. Refine with ``estimate_beta`` (assignment locked to ``z``)
+          3. Record reconstruction (+ optional cog) LSE at the refined beta
+
+        Probabilities are ``softmax(-LSE / temperature)``. ``subtype_best`` is
+        the argmax over those probabilities. ``beta`` / ``subtype`` match the
+        regular ``transform`` joint grid-search path (best subtype after refine).
+
+        Returns a structured array with fields:
+          beta, subtype, subtype_best,
+          beta_1 .. beta_K, proba_1 .. proba_K
+        (1-indexed subtype columns).
+        """
+        if not hasattr(self, "cluster_f") or not hasattr(self, "cluster_cog_a"):
+            raise RuntimeError("fit() must be called before transform_soft()")
+        if temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {temperature}")
+
+        n_patients = len(X)
+        n_biomarkers = X[0]["X_obs"].shape[1]
+        n_subtypes = self.n_subtypes
+        lam_cog = self.lambda_cog if use_cognitive_prior else 0.0
+
+        # estimate_beta expects list-of-per-subtype arrays (not a stacked ndarray).
+        cluster_f = [
+            np.ravel(self.cluster_f[z]) for z in range(n_subtypes)
+        ]
+        if isinstance(self.cluster_cog_a, list):
+            cluster_cog_a = self.cluster_cog_a
+            cluster_cog_b = self.cluster_cog_b
+        else:
+            cluster_cog_a = [
+                np.asarray(self.cluster_cog_a[z], dtype=float)
+                for z in range(n_subtypes)
+            ]
+            cluster_cog_b = [
+                float(self.cluster_cog_b[z]) for z in range(n_subtypes)
+            ]
+
+        dtype = [
+            ("beta", "f8"),
+            ("subtype", "i4"),
+            ("subtype_best", "i4"),
+        ]
+        for z in range(n_subtypes):
+            dtype.append((f"beta_{z + 1}", "f8"))
+        for z in range(n_subtypes):
+            dtype.append((f"proba_{z + 1}", "f8"))
+        results = np.zeros(n_patients, dtype=dtype)
+
+        X_preds = [
+            solve_system(
+                np.zeros(n_biomarkers),
+                cluster_f[z],
+                self.K,
+                self.t_span,
+                self.final_scalar_K,
+                self.final_kappa,
+                ode_method=self.ode_method,
+            )
+            for z in range(n_subtypes)
+        ]
+        beta_grid = np.linspace(0.1 * self.t_max, 0.9 * self.t_max, self.n_beta_grid)
+
+        for idx, p in enumerate(
+            tqdm(X, desc="Estimating per-subtype beta and probabilities")
+        ):
+            X_obs_i = p["X_obs"]
+            dt_i = p["dt"]
+            cog_i = p["cog"]
+            if cog_i.ndim == 1:
+                cog_i = cog_i.reshape(-1, 1)
+
+            sse_grid = np.zeros((self.n_beta_grid, n_subtypes))
+            for z in range(n_subtypes):
+                cog_pred_z = cog_i @ cluster_cog_a[z] + cluster_cog_b[z]
+                for gi, beta_g in enumerate(beta_grid):
+                    sse_grid[gi, z] = reconstruction_sse(
+                        beta_g, X_obs_i, dt_i, X_preds[z], self.t_span, self.final_s
+                    )
+                    if lam_cog > 0:
+                        sse_grid[gi, z] += lam_cog * np.sum(
+                            (dt_i + beta_g - cog_pred_z) ** 2
+                        )
+
+            beta_by_z = np.zeros(n_subtypes, dtype=float)
+            lse_by_z = np.zeros(n_subtypes, dtype=float)
+            for z in range(n_subtypes):
+                best_gi = int(np.argmin(sse_grid[:, z]))
+                beta_vec, lse_z = estimate_beta(
+                    beta_all=np.array([beta_grid[best_gi]], dtype=float),
+                    X_obs=X_obs_i,
+                    dt=dt_i,
+                    ids=np.zeros(len(dt_i), dtype=int),
+                    cog=cog_i,
+                    t_span=self.t_span,
+                    cluster_f=cluster_f,
+                    scalar_K=self.final_scalar_K,
+                    s=self.final_s,
+                    assignments=np.array([z], dtype=int),
+                    K=self.K,
+                    cog_a=cluster_cog_a,
+                    cog_b=cluster_cog_b,
+                    lambda_cog=lam_cog,
+                    lambda_jsd=0.0,
+                    lambda_beta=0.0,
+                    beta_mean=None,
+                    beta_var=None,
+                    t_max=self.t_max,
+                    kappa=self.final_kappa,
+                    ode_method=self.ode_method,
+                )
+                beta_by_z[z] = float(beta_vec[0])
+                lse_by_z[z] = float(lse_z)
+                results[idx][f"beta_{z + 1}"] = beta_by_z[z]
+
+            log_p = -lse_by_z / temperature
+            log_p -= np.max(log_p)
+            proba = np.exp(log_p)
+            proba /= proba.sum()
+            for z in range(n_subtypes):
+                results[idx][f"proba_{z + 1}"] = float(proba[z])
+
+            subtype_best = int(np.argmax(proba))
+            results[idx]["subtype_best"] = subtype_best
+
+            # Regular transform: joint best (grid) then refine under that subtype.
+            best_gi, best_z = np.unravel_index(np.argmin(sse_grid), sse_grid.shape)
+            beta_vec, _ = estimate_beta(
+                beta_all=np.array([beta_grid[best_gi]], dtype=float),
+                X_obs=X_obs_i,
+                dt=dt_i,
+                ids=np.zeros(len(dt_i), dtype=int),
+                cog=cog_i,
+                t_span=self.t_span,
+                cluster_f=cluster_f,
+                scalar_K=self.final_scalar_K,
+                s=self.final_s,
+                assignments=np.array([best_z], dtype=int),
+                K=self.K,
+                cog_a=cluster_cog_a,
+                cog_b=cluster_cog_b,
+                lambda_cog=lam_cog,
+                lambda_jsd=0.0,
+                lambda_beta=0.0,
+                beta_mean=None,
+                beta_var=None,
+                t_max=self.t_max,
+                kappa=self.final_kappa,
+                ode_method=self.ode_method,
+            )
+            results[idx]["beta"] = float(beta_vec[0])
+            results[idx]["subtype"] = int(best_z)
+
+        self.beta_val = results["beta"]
+        self.transform_assignments = results["subtype"]
+        self.assignment_probabilities_ = np.column_stack(
+            [results[f"proba_{z + 1}"] for z in range(n_subtypes)]
+        )
+        return results
+
     def score(self, X: list, y=None) -> float:
         """Negative reconstruction LSE on X (higher = better, for sklearn CV)."""
         return -self._compute_val_score(X, self.transform(X)["beta"])
