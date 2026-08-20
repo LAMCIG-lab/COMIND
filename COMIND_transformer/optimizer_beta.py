@@ -12,13 +12,20 @@ def reconstruction_sse(
     X_pred: np.ndarray,
     t_span: np.ndarray,
     s: np.ndarray,
+    obs_weight_i: np.ndarray = None,
 ) -> float:
-    """Reconstruction-only SSE for one patient against one subtype trajectory."""
+    """Reconstruction-only SSE for one patient against one subtype trajectory.
+
+    ``obs_weight_i`` is an optional (n_timepoints, n_biomarkers) array
+    (1.0 = observed, 0.0 = missing). ``None`` treats every entry as observed.
+    """
     t_pred_i = dt_i + beta_i
     X_interp_i = np.array(
         [np.interp(t_pred_i, t_span, s[b] * X_pred[b]) for b in range(X_pred.shape[0])]
     )
     residuals = X_obs_i.T - X_interp_i
+    if obs_weight_i is not None:
+        residuals = residuals * obs_weight_i.T
     return float(np.sum(residuals ** 2))
 
 
@@ -47,8 +54,14 @@ def _vectorized_beta_loss_and_grad(
     lambda_beta: float = 0.0,
     beta_mean: float = None,
     beta_var: float = None,
+    obs_weight: np.ndarray = None,
 ) -> tuple:
-    """Loss/gradient for all patient betas using precomputed subtype trajectories."""
+    """Loss/gradient for all patient betas using precomputed subtype trajectories.
+
+    ``obs_weight`` is an optional (n_rows, n_biomarkers) array matching
+    stacked ``X_obs`` (1.0 = observed, 0.0 = missing). ``None`` treats
+    every entry as observed.
+    """
     unique_ids = np.unique(ids)
     n_patients = len(unique_ids)
     n_biomarkers = X_obs.shape[1]
@@ -82,6 +95,9 @@ def _vectorized_beta_loss_and_grad(
                 [np.interp(t_pred_i, t_span, s[b] * X_pred_k[b]) for b in range(n_biomarkers)]
             )
             residuals = X_obs_i.T - X_interp_i
+            w_i = obs_weight[mask, :] if obs_weight is not None else None
+            if w_i is not None:
+                residuals = residuals * w_i.T
             total_loss += np.sum(residuals ** 2)
 
             dxdt_interp_i = np.array(
@@ -152,8 +168,14 @@ def estimate_beta(
     kappa: np.ndarray = None,
     strict_tol: bool = False,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> tuple:
-    """Optimize all patient betas jointly with precomputed subtype trajectories."""
+    """Optimize all patient betas jointly with precomputed subtype trajectories.
+
+    ``obs_weight`` is an optional (n_rows, n_biomarkers) array matching
+    stacked ``X_obs`` (1.0 = observed, 0.0 = missing). ``None`` treats
+    every entry as observed.
+    """
     unique_ids = np.unique(ids)
     n_patients = len(unique_ids)
     n_biomarkers = X_obs.shape[1]
@@ -208,6 +230,7 @@ def estimate_beta(
             lambda_beta,
             beta_mean,
             beta_var,
+            obs_weight,
         )
 
     lbfgs_options = {"maxiter": 100}
@@ -237,6 +260,9 @@ def estimate_beta(
             [np.interp(t_pred_i, t_span, s[b] * X_pred_cluster_i[b]) for b in range(n_biomarkers)]
         )
         residuals = X_obs_i.T - X_interp_i
+        w_i = obs_weight[mask, :] if obs_weight is not None else None
+        if w_i is not None:
+            residuals = residuals * w_i.T
         reconstruction_lse += np.sum(residuals ** 2)
 
     return optimized_beta, reconstruction_lse

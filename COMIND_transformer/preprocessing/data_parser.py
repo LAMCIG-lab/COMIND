@@ -27,14 +27,16 @@ def parse_data(
 
     One dict per unique subj_id_col value, visits sorted by time_col:
       - "id": subject id
-      - "X_obs": (n_visits, len(X_cols)) float array
+      - "X_obs": (n_visits, len(X_cols)) float array; NaN marks a missing
+        biomarker at that visit (masked-likelihood in SubtypingEM)
       - "dt": (n_visits,) float array, raw time_col values
       - "cog": (n_visits, len(clinical_cols)) float array
       - one array per metadata_cols entry, raw dtype, NaN allowed
 
-    Raises if id_col, time_col, X_cols, or clinical_cols contain missing
-    values -- clinical_cols feeds a linear regression (beta initialization)
-    that cannot handle NaN cleanly. Only metadata_cols may be NaN-inclusive.
+    Raises if id_col, time_col, or clinical_cols contain missing values --
+    clinical_cols feeds a linear regression (beta initialization) that
+    cannot handle NaN cleanly. X_cols may contain NaN (per-entry missing
+    biomarkers). Only metadata_cols and X_cols may be NaN-inclusive.
     """
     required = [subj_id_col, time_col] + list(X_cols) + list(clinical_cols) + list(metadata_cols)
     missing_cols = [c for c in required if c not in data.columns]
@@ -65,11 +67,13 @@ def parse_data(
                 f"({len(bad_ids)} subject(s), e.g. {list(bad_ids[:5])}). {reason}"
             )
 
-    _check_complete(
-        X_cols, "X_cols",
-        "SubtypingEM cannot fit with NaN in X_obs -- drop or impute these rows "
-        "before calling parse_data.",
-    )
+    n_missing = int(data[X_cols].isna().sum().sum()) if X_cols else 0
+    if n_missing > 0:
+        warnings.warn(
+            f"X_cols contain {n_missing} missing value(s); SubtypingEM will "
+            f"omit those scalar entries from the likelihood (MAR/MCAR).",
+            stacklevel=2,
+        )
     _check_complete(
         clinical_cols, "clinical_cols",
         "The beta-initialization regression cannot fit with NaN in cog -- drop "

@@ -43,6 +43,7 @@ def sse_matrix(
     cluster_cog_a=None,
     cluster_cog_b=None,
     lambda_cog=0.0,
+    obs_weight=None,
 ):
     """
     Per-patient, per-subtype reconstruction SSE (plus cognitive penalty if enabled).
@@ -54,6 +55,9 @@ def sse_matrix(
     beta : (n_patients,)
     X_preds : list of (n_biomarkers, len(t_span))
     s : (n_biomarkers,)
+    obs_weight : (n_rows, n_biomarkers) or None
+        Elementwise 1.0 = observed, 0.0 = missing. ``None`` treats every
+        entry as observed.
 
     Returns
     -------
@@ -84,7 +88,11 @@ def sse_matrix(
             X_interp = np.empty_like(X_i)
             for b in range(n_biomarkers):
                 X_interp[:, b] = np.interp(t_pred, t_span, s[b] * X_pred_k[b])
-            total = float(np.sum((X_i - X_interp) ** 2))
+            residuals = X_i - X_interp
+            w_i = obs_weight[mask] if obs_weight is not None else None
+            if w_i is not None:
+                residuals = residuals * w_i
+            total = float(np.sum(residuals ** 2))
             if use_cog:
                 cog_i = cog[mask]
                 cog_pred = cog_i @ cluster_cog_a[k] + cluster_cog_b[k]
@@ -110,6 +118,7 @@ def update_assignments_hard(
     cluster_cog_b,
     lambda_cog,
     ode_method="LSODA",
+    obs_weight=None,
 ):
     """Hard E-step: assign each patient to the subtype with minimum SSE."""
     X_preds = precompute_trajectories(
@@ -119,6 +128,7 @@ def update_assignments_hard(
         X_obs, dt, ids, beta, X_preds, s, t_span,
         cog=cog, cluster_cog_a=cluster_cog_a, cluster_cog_b=cluster_cog_b,
         lambda_cog=lambda_cog,
+        obs_weight=obs_weight,
     )
     return np.argmin(sse, axis=1).astype(int)
 
@@ -141,6 +151,7 @@ def update_assignments_jitter(
     temperature=1.0,
     rng=None,
     ode_method="LSODA",
+    obs_weight=None,
 ):
     """
     Sample assignments from softmax(-SSE / temperature).
@@ -167,9 +178,11 @@ def update_assignments_jitter(
         beta_i = beta[p_idx]
 
         sse_vec = np.zeros(n_subtypes)
+        w_i = obs_weight[mask] if obs_weight is not None else None
         for subtype in range(n_subtypes):
             sse_vec[subtype] = reconstruction_sse(
-                beta_i, X_obs_i, dt_i, X_preds[subtype], t_span, s
+                beta_i, X_obs_i, dt_i, X_preds[subtype], t_span, s,
+                obs_weight_i=w_i,
             )
 
         log_p = -sse_vec / temperature

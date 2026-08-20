@@ -36,6 +36,7 @@ def theta_cluster_loss(
     lambda_f: float,
     kappa: np.ndarray = None,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> float:
     """Loss for cluster-level f with fixed global s and scalar_K."""
     n_biomarkers = x_obs.shape[1]
@@ -51,6 +52,8 @@ def theta_cluster_loss(
         x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
 
     residuals = x_obs - x_pred
+    if obs_weight is not None:
+        residuals = residuals * obs_weight
     return np.sum(residuals ** 2) + lambda_f * np.sum(f)
 
 
@@ -65,6 +68,7 @@ def theta_cluster_loss_jac(
     lambda_f: float,
     kappa: np.ndarray = None,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> tuple:
     """Loss and approximate gradient for cluster-level f (cumulative_simpson)."""
     n_biomarkers = x_obs.shape[1]
@@ -81,6 +85,8 @@ def theta_cluster_loss_jac(
         x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
 
     residuals = x_obs - x_pred
+    if obs_weight is not None:
+        residuals = residuals * obs_weight
     loss = np.sum(residuals ** 2) + lambda_f * np.sum(f)
 
     cum_int = np.array([
@@ -112,6 +118,7 @@ def theta_cluster_loss_jac_exact(
     lambda_f: float,
     kappa: np.ndarray = None,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> tuple:
     """Loss and gradient w.r.t. f using exact sensitivities solved with LSODA."""
     n_biomarkers = x_obs.shape[1]
@@ -129,6 +136,8 @@ def theta_cluster_loss_jac_exact(
         x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
 
     residuals = x_obs - x_pred
+    if obs_weight is not None:
+        residuals = residuals * obs_weight
     loss = np.sum(residuals ** 2) + lambda_f * np.sum(f)
 
     U = integrate_f_sensitivities_lsoda(t_span, x, K_eff, K, f)
@@ -151,6 +160,7 @@ def theta_cluster_loss_jac_rk4(
     lambda_f: float,
     kappa: np.ndarray = None,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> tuple:
     """Loss and gradient w.r.t. f using RK4 sensitivities on t_span."""
     n_biomarkers = x_obs.shape[1]
@@ -168,6 +178,8 @@ def theta_cluster_loss_jac_rk4(
         x_pred[:, j] = np.interp(t_obs_clamped, t_span, x_scaled[j])
 
     residuals = x_obs - x_pred
+    if obs_weight is not None:
+        residuals = residuals * obs_weight
     loss = np.sum(residuals ** 2) + lambda_f * np.sum(f)
 
     U = integrate_all_sensitivities_rk4(
@@ -198,6 +210,7 @@ def fit_theta_cluster(
     method: str = "lbfgs_approx",
     strict_tol: bool = False,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> np.ndarray:
     """
     Optimizes cluster-level f for patients in a specific cluster.
@@ -233,7 +246,7 @@ def fit_theta_cluster(
             "'lbfgs_approx', 'lbfgs_exact', 'lbfgs_rk4', or 'nelder_mead'."
         )
 
-    args = (t_pred, X_obs, K, t_span, s, scalar_K, lambda_f, kappa, ode_method)
+    args = (t_pred, X_obs, K, t_span, s, scalar_K, lambda_f, kappa, ode_method, obs_weight)
 
     minimize_kwargs = dict(
         fun=loss_fn,

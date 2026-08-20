@@ -3,6 +3,17 @@ SubtypingEM: EM algorithm for COMIND disease progression modeling with subtype d
 
 sklearn-compatible (BaseEstimator, TransformerMixin).
 
+Missing biomarker entries are indicated by NaN in a patient's ``X_obs``
+array (shape (n_visits, n_biomarkers)). Because the likelihood is a
+product of independent per-entry Gaussians, the EM treatment of a
+missing y^k_ij is to omit its term from the sum of squares (equivalent
+to taking the expectation of the log-likelihood under the model's own
+current prediction). This is implemented as an elementwise weight
+(1.0 = observed, 0.0 = missing) multiplied into every residual. A whole
+missing visit is already handled by omitting that row; this mechanism
+is for missing entries within an otherwise-present visit. Assumes
+MAR/MCAR missingness (not MNAR).
+
 fit() is organized into four helpers:
 
     _prepare_data     flatten patient dicts → stacked numpy arrays
@@ -16,6 +27,7 @@ E-step and BIC helpers live in assignments.py and model_selection.py.
 import os
 import signal
 import time
+import warnings
 import numpy as np
 from tqdm import tqdm
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -40,6 +52,7 @@ from .utils import (
     initialize_beta,
     ensure_2d_cog,
     match_labels_best_overlap,
+    split_observed,
 )
 
 
@@ -59,6 +72,19 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     """
     EM algorithm for recovering disease progression model parameters
     and patient-specific time shifts from cross-sectional observations.
+
+    Missing data: NaN in a patient's ``X_obs`` marks a missing biomarker
+    at that visit. The likelihood is a product of independent per-entry
+    Gaussians (paper eq. 4), so the EM treatment of a missing y^k_ij is
+    to omit its squared-residual term — equivalent to taking the
+    expectation of that term under N(current prediction, sigma_k^2),
+    which is a constant independent of theta and beta. Implemented as
+    an elementwise ``obs_weight`` (1.0 = observed, 0.0 = missing)
+    multiplied into every residual. Assumes missingness is MAR/MCAR
+    (not MNAR: e.g. not "segmentation failed because atrophy was too
+    severe to parcellate"). A whole missing visit is handled by
+    omitting that row; this mechanism is for missing entries within an
+    otherwise-present visit.
 
     Global (s, kappa, scalar_K) and cluster (f) θ-steps use staged optimizers
     from ``theta_solver_stages`` (default ``lbfgs_approx`` → ``nelder_mead``).
@@ -221,7 +247,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         beta_grid = np.linspace(0.1 * self.t_max, 0.9 * self.t_max, self.n_beta_grid)
 
         for idx, p in enumerate(tqdm(X, desc="Estimating beta and subtype assignments")):
-            X_obs_i = p["X_obs"]
+            X_obs_i, obs_weight_i = split_observed(p["X_obs"])
             dt_i = p["dt"]
             cog_i = p["cog"]
             if cog_i.ndim == 1:
@@ -232,7 +258,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 cog_pred_z = cog_i @ self.cluster_cog_a[z] + self.cluster_cog_b[z]
                 for gi, beta_g in enumerate(beta_grid):
                     sse_grid[gi, z] = reconstruction_sse(
-                        beta_g, X_obs_i, dt_i, X_preds[z], self.t_span, self.final_s
+                        beta_g, X_obs_i, dt_i, X_preds[z], self.t_span, self.final_s,
+                        obs_weight_i=obs_weight_i,
                     )
                     if lam_cog > 0:
                         sse_grid[gi, z] += lam_cog * np.sum(
@@ -262,6 +289,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 beta_var=None,
                 t_max=self.t_max,
                 kappa=self.final_kappa,
+                obs_weight=obs_weight_i,
             )
             results[idx]["beta"] = float(beta_vec[0])
             results[idx]["subtype"] = best_z
@@ -275,6 +303,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         X: list,
         use_cognitive_prior: bool = True,
         temperature: float = 1.0,
+        per_timepoint: bool = False,
     ) -> np.ndarray:
         """
         Per-patient beta under each subtype, plus softmax probabilities from LSE.
@@ -288,10 +317,18 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         the argmax over those probabilities. ``beta`` / ``subtype`` match the
         regular ``transform`` joint grid-search path (best subtype after refine).
 
+        If ``per_timepoint`` is True, beta is still estimated from all visits
+        (one shift per subject, so observed ``dt`` spacing is preserved). The
+        return array is then expanded to one row per visit. ``t_obs`` is
+        ``beta + dt`` at that visit. Visit-level ``proba_*`` use only that
+        visit's residual against each subtype trajectory at ``t_obs`` (optional
+        cog term uses that visit only). Each visit's ``proba_*`` sum to 1.
+
         Returns a structured array with fields:
           beta, subtype, subtype_best,
           beta_1 .. beta_K, proba_1 .. proba_K
-        (1-indexed subtype columns).
+        (1-indexed subtype columns). With ``per_timepoint=True`` also:
+          patient_idx, visit, t_obs, id.
         """
         if not hasattr(self, "cluster_f") or not hasattr(self, "cluster_cog_a"):
             raise RuntimeError("fit() must be called before transform_soft()")
@@ -324,11 +361,25 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             ("subtype", "i4"),
             ("subtype_best", "i4"),
         ]
+        if per_timepoint:
+            dtype.extend([
+                ("patient_idx", "i4"),
+                ("visit", "i4"),
+                ("t_obs", "f8"),
+                ("id", "O"),
+            ])
         for z in range(n_subtypes):
             dtype.append((f"beta_{z + 1}", "f8"))
         for z in range(n_subtypes):
             dtype.append((f"proba_{z + 1}", "f8"))
-        results = np.zeros(n_patients, dtype=dtype)
+
+        n_rows = (
+            sum(np.asarray(p["dt"]).reshape(-1).size for p in X)
+            if per_timepoint else n_patients
+        )
+        results = np.zeros(n_rows, dtype=dtype)
+        beta_val = np.zeros(n_patients, dtype=float)
+        transform_assignments = np.zeros(n_patients, dtype=np.int32)
 
         X_preds = [
             solve_system(
@@ -344,11 +395,33 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         ]
         beta_grid = np.linspace(0.1 * self.t_max, 0.9 * self.t_max, self.n_beta_grid)
 
+        def _softmax_from_lse(lse):
+            log_p = -np.asarray(lse, dtype=float) / temperature
+            log_p -= np.max(log_p)
+            proba = np.exp(log_p)
+            proba /= proba.sum()
+            return proba
+
+        def _write_row(row, beta, subtype, subtype_best, beta_by_z, proba,
+                       patient_idx=None, visit=None, t_obs=None, pid=None):
+            results[row]["beta"] = float(beta)
+            results[row]["subtype"] = int(subtype)
+            results[row]["subtype_best"] = int(subtype_best)
+            for z in range(n_subtypes):
+                results[row][f"beta_{z + 1}"] = float(beta_by_z[z])
+                results[row][f"proba_{z + 1}"] = float(proba[z])
+            if per_timepoint:
+                results[row]["patient_idx"] = int(patient_idx)
+                results[row]["visit"] = int(visit)
+                results[row]["t_obs"] = float(t_obs)
+                results[row]["id"] = pid
+
+        row = 0
         for idx, p in enumerate(
             tqdm(X, desc="Estimating per-subtype beta and probabilities")
         ):
-            X_obs_i = p["X_obs"]
-            dt_i = p["dt"]
+            X_obs_i, obs_weight_i = split_observed(p["X_obs"])
+            dt_i = np.asarray(p["dt"], dtype=float).reshape(-1)
             cog_i = p["cog"]
             if cog_i.ndim == 1:
                 cog_i = cog_i.reshape(-1, 1)
@@ -358,7 +431,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 cog_pred_z = cog_i @ cluster_cog_a[z] + cluster_cog_b[z]
                 for gi, beta_g in enumerate(beta_grid):
                     sse_grid[gi, z] = reconstruction_sse(
-                        beta_g, X_obs_i, dt_i, X_preds[z], self.t_span, self.final_s
+                        beta_g, X_obs_i, dt_i, X_preds[z], self.t_span, self.final_s,
+                        obs_weight_i=obs_weight_i,
                     )
                     if lam_cog > 0:
                         sse_grid[gi, z] += lam_cog * np.sum(
@@ -391,20 +465,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     t_max=self.t_max,
                     kappa=self.final_kappa,
                     ode_method=self.ode_method,
+                    obs_weight=obs_weight_i,
                 )
                 beta_by_z[z] = float(beta_vec[0])
                 lse_by_z[z] = float(lse_z)
-                results[idx][f"beta_{z + 1}"] = beta_by_z[z]
-
-            log_p = -lse_by_z / temperature
-            log_p -= np.max(log_p)
-            proba = np.exp(log_p)
-            proba /= proba.sum()
-            for z in range(n_subtypes):
-                results[idx][f"proba_{z + 1}"] = float(proba[z])
-
-            subtype_best = int(np.argmax(proba))
-            results[idx]["subtype_best"] = subtype_best
 
             # Regular transform: joint best (grid) then refine under that subtype.
             best_gi, best_z = np.unravel_index(np.argmin(sse_grid), sse_grid.shape)
@@ -430,12 +494,61 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 t_max=self.t_max,
                 kappa=self.final_kappa,
                 ode_method=self.ode_method,
+                obs_weight=obs_weight_i,
             )
-            results[idx]["beta"] = float(beta_vec[0])
-            results[idx]["subtype"] = int(best_z)
+            beta_joint = float(beta_vec[0])
+            best_z = int(best_z)
+            beta_val[idx] = beta_joint
+            transform_assignments[idx] = best_z
+            pid = p.get("id", idx)
 
-        self.beta_val = results["beta"]
-        self.transform_assignments = results["subtype"]
+            if per_timepoint:
+                n_t = len(dt_i)
+                t_obs = dt_i + beta_joint
+                for t in range(n_t):
+                    lse_t = np.zeros(n_subtypes, dtype=float)
+                    for z in range(n_subtypes):
+                        lse_t[z] = reconstruction_sse(
+                            beta_joint,
+                            X_obs_i[t:t + 1],
+                            dt_i[t:t + 1],
+                            X_preds[z],
+                            self.t_span,
+                            self.final_s,
+                            obs_weight_i=obs_weight_i[t:t + 1],
+                        )
+                        if lam_cog > 0:
+                            cog_pred_tz = float(
+                                cog_i[t] @ cluster_cog_a[z] + cluster_cog_b[z]
+                            )
+                            lse_t[z] += lam_cog * (t_obs[t] - cog_pred_tz) ** 2
+                    proba = _softmax_from_lse(lse_t)
+                    _write_row(
+                        row,
+                        beta_joint,
+                        best_z,
+                        int(np.argmax(proba)),
+                        beta_by_z,
+                        proba,
+                        patient_idx=idx,
+                        visit=t,
+                        t_obs=t_obs[t],
+                        pid=pid,
+                    )
+                    row += 1
+            else:
+                proba = _softmax_from_lse(lse_by_z)
+                _write_row(
+                    idx,
+                    beta_joint,
+                    best_z,
+                    int(np.argmax(proba)),
+                    beta_by_z,
+                    proba,
+                )
+
+        self.beta_val = beta_val
+        self.transform_assignments = transform_assignments
         self.assignment_probabilities_ = np.column_stack(
             [results[f"proba_{z + 1}"] for z in range(n_subtypes)]
         )
@@ -474,18 +587,40 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             if "initial_beta" in patient:
                 ibeta_list.append(patient["initial_beta"])
 
-        X_obs = np.vstack(X_obs_list)
+        X_obs_raw = np.vstack(X_obs_list)
         dt = np.concatenate(dt_list)
         ids = np.concatenate(ids_list)
         cog = np.vstack(cog_list)
 
-        if not (len(dt) == len(ids) == X_obs.shape[0] == cog.shape[0]):
+        if not (len(dt) == len(ids) == X_obs_raw.shape[0] == cog.shape[0]):
             raise ValueError(
-                f"Stacked shapes disagree: X_obs={X_obs.shape}, dt={dt.shape}, "
+                f"Stacked shapes disagree: X_obs={X_obs_raw.shape}, dt={dt.shape}, "
                 f"ids={ids.shape}, cog={cog.shape}"
             )
         if cog.ndim == 1:
             cog = np.atleast_2d(cog).T
+
+        n_obs_per_b = np.sum(np.isfinite(X_obs_raw), axis=0)
+        if np.any(n_obs_per_b < 2):
+            bad = np.where(n_obs_per_b < 2)[0]
+            raise ValueError(
+                f"Biomarker(s) {bad.tolist()} have fewer than 2 observed values "
+                f"cohort-wide; null variance for BIC cannot be estimated."
+            )
+        var_per_biomarker_null = np.maximum(
+            np.nanvar(X_obs_raw, axis=0, ddof=1), 1e-12
+        )
+        X_obs, obs_weight = split_observed(X_obs_raw)
+        n_obs = int(obs_weight.sum())
+
+        for i in range(n_patients):
+            if obs_weight[ids == i].sum() == 0:
+                warnings.warn(
+                    f"Patient index {i} has zero observed biomarker entries; "
+                    f"beta is unidentified from reconstruction alone.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         if self.initial_beta is not None:
             beta = np.asarray(self.initial_beta, dtype=float).copy()
@@ -521,8 +656,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             initial_beta=beta,
             beta_mean=beta_mean,
             beta_var=beta_var,
-            n_obs=X_obs.shape[0] * X_obs.shape[1],
-            var_per_biomarker_null=np.maximum(np.var(X_obs, axis=0, ddof=1), 1e-12),
+            n_obs=n_obs,
+            var_per_biomarker_null=var_per_biomarker_null,
+            obs_weight=obs_weight,
         )
 
     def _initialize_state(self, flat, X):
@@ -618,6 +754,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             cluster_cog_a=cluster_cog_a,
             cluster_cog_b=cluster_cog_b,
             lambda_cog=self.lambda_cog,
+            obs_weight=flat["obs_weight"],
         )
         initial_lse = float(np.sum(sse_mat[np.arange(n_patients), assignments]))
 
@@ -792,6 +929,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 cluster_f=state["cluster_f"],
                 strict_tol=self.strict_tol,
                 ode_method=self.ode_method,
+                obs_weight=flat["obs_weight"],
             )
         )
 
@@ -821,6 +959,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 temperature=self.jitter_temperature,
                 rng=self.rng,
                 ode_method=self.ode_method,
+                obs_weight=flat["obs_weight"],
             )
             self.assignment_probabilities_ = probs
         else:
@@ -840,6 +979,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 state["cluster_cog_b"],
                 self.lambda_cog,
                 ode_method=self.ode_method,
+                obs_weight=flat["obs_weight"],
             )
 
         for z in range(self.n_subtypes):
@@ -885,6 +1025,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     kappa=state["current_kappa"],
                     strict_tol=self.strict_tol,
                     ode_method=self.ode_method,
+                    obs_weight=flat["obs_weight"][obs_mask, :],
                 )
             )
 
@@ -911,6 +1052,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             kappa=state["current_kappa"],
             strict_tol=self.strict_tol,
             ode_method=self.ode_method,
+            obs_weight=flat["obs_weight"],
         )
 
         return lse
@@ -996,6 +1138,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.K,
             self.t_span,
             ode_method=self.ode_method,
+            obs_weight=flat["obs_weight"],
         )
         k = count_bic_params(
             self.final_s,
@@ -1162,6 +1305,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         )
         lse = 0.0
         for i, p in enumerate(X):
+            X_obs_i, obs_weight_i = split_observed(p["X_obs"])
             tp = beta[i] + p["dt"]
             X_interp = np.vstack(
                 [
@@ -1169,5 +1313,5 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     for b in range(n_biomarkers)
                 ]
             ).T
-            lse += np.sum((p["X_obs"] - X_interp) ** 2)
+            lse += np.sum(((X_obs_i - X_interp) * obs_weight_i) ** 2)
         return lse

@@ -53,8 +53,14 @@ def _solve_and_residuals(
     observation_assignments: np.ndarray,
     fit_s: bool = True,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ):
-    """Unpack globals, solve subtype trajectories, build x_pred and residuals."""
+    """Unpack globals, solve subtype trajectories, build x_pred and residuals.
+
+    ``obs_weight`` is an optional (n_rows, n_biomarkers) array (1.0 =
+    observed, 0.0 = missing). Residuals are masked here so every caller
+    gets pre-masked residuals. ``None`` treats every entry as observed.
+    """
     n_biomarkers = x_obs.shape[1]
     if fit_s:
         s = params[:n_biomarkers]
@@ -86,6 +92,8 @@ def _solve_and_residuals(
             x_pred[mask_k, j] = np.interp(t_k, t_span, x_scaled_k[j])
 
     residuals = x_obs - x_pred
+    if obs_weight is not None:
+        residuals = residuals * obs_weight
     return s, kappa, scalar_K, x_list, x_pred, residuals
 
 
@@ -103,6 +111,7 @@ def theta_s_loss_multi(
     scalar_K_center: float = SCALAR_K_CENTER,
     fit_s: bool = True,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> float:
     """
     Loss for s and scalar_K when each observation uses its assigned subtype's f.
@@ -112,6 +121,7 @@ def theta_s_loss_multi(
         params, t_obs, x_obs, K, t_span, cluster_f, observation_assignments,
         fit_s=fit_s,
         ode_method=ode_method,
+        obs_weight=obs_weight,
     )
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
     lognorm_penalty = _lognorm_scalar_K_penalty(
@@ -140,6 +150,7 @@ def theta_s_loss_jac_exact_multi(
     scalar_K_center: float = SCALAR_K_CENTER,
     fit_s: bool = True,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> tuple:
     """
     Same loss as theta_s_loss_multi; gradients via sensitivity IVPs integrated
@@ -149,6 +160,7 @@ def theta_s_loss_jac_exact_multi(
         params, t_obs, x_obs, K, t_span, cluster_f, observation_assignments,
         fit_s=fit_s,
         ode_method=ode_method,
+        obs_weight=obs_weight,
     )
     n_biomarkers = x_obs.shape[1]
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
@@ -222,6 +234,7 @@ def theta_s_loss_jac_rk4_multi(
     scalar_K_center: float = SCALAR_K_CENTER,
     fit_s: bool = True,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> tuple:
     """
     Same loss as theta_s_loss_multi; gradients via RK4 sensitivities on t_span.
@@ -230,6 +243,7 @@ def theta_s_loss_jac_rk4_multi(
         params, t_obs, x_obs, K, t_span, cluster_f, observation_assignments,
         fit_s=fit_s,
         ode_method=ode_method,
+        obs_weight=obs_weight,
     )
     n_biomarkers = x_obs.shape[1]
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
@@ -311,6 +325,7 @@ def fit_theta_globals(
     method: str = "lbfgs_approx",
     strict_tol: bool = False,
     ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
 ) -> tuple:
     """
     Optimizes global (s, kappa, scalar_K) using assignment-aware subtype trajectories.
@@ -375,6 +390,7 @@ def fit_theta_globals(
         scalar_K_center,
         fit_s,
         ode_method,
+        obs_weight,
     )
 
     minimize_kwargs = dict(

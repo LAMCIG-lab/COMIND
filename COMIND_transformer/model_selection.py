@@ -4,7 +4,7 @@ import numpy as np
 
 from .utils import solve_system
 
-def count_bic_params(final_s, final_kappa, cluster_f, n_subtypes, lambda_cog, cluster_cog_a=None):
+def count_bic_params(final_s, final_kappa, cluster_f, n_subtypes, lambda_cog, cluster_cog_a=None, fit_s=True):
     """
     Count free model parameters for BIC.
 
@@ -32,7 +32,9 @@ def count_bic_params(final_s, final_kappa, cluster_f, n_subtypes, lambda_cog, cl
     n_biomarkers = final_s.shape[0]
 
     kappa_active = int(np.sum(np.abs(final_kappa) >= threshold))
-    k = n_biomarkers + kappa_active + 1     # s  +  active kappa  +  scalar_K
+    k = kappa_active + 1                    # active kappa + scalar_K
+    if fit_s:
+        k += n_biomarkers                   # per-biomarker supremum s
 
     if lambda_cog > 0 and cluster_cog_a:
         n_cog = np.asarray(cluster_cog_a[0]).shape[0]
@@ -58,8 +60,15 @@ def compute_bic(sse_per_biomarker, var_per_biomarker_null, n_obs, k):
     ----------
     sse_per_biomarker    : (n_biomarkers,)
     var_per_biomarker_null : (n_biomarkers,)
-    n_obs               : int  — total scalar observations (rows × biomarkers)
+    n_obs               : int  — count of OBSERVED scalar entries (not
+                                 rows × biomarkers when data is missing).
+                                 The caller is responsible for passing
+                                 ``int(obs_weight.sum())``.
     k                   : int  — number of free parameters
+
+    When data is missing, ``var_per_biomarker_null`` must be computed with
+    a NaN-aware variance (e.g. ``np.nanvar``); that is also the caller's
+    responsibility.
 
     Returns
     -------
@@ -83,9 +92,13 @@ def compute_sse_per_biomarker(
     K,
     t_span,
     ode_method="LSODA",
+    obs_weight=None,
 ):
     """
     Sum of squared errors per biomarker on training data.
+
+    ``obs_weight`` is an optional (n_rows, n_biomarkers) array (1.0 =
+    observed, 0.0 = missing). ``None`` treats every entry as observed.
 
     Returns
     -------
@@ -111,5 +124,8 @@ def compute_sse_per_biomarker(
         pred_r = np.array([
             np.interp(t, t_span, X_pred_sub[b] * s[b]) for b in range(n_biomarkers)
         ])
-        sse_per_b += (X_obs[r] - pred_r) ** 2
+        resid_r = X_obs[r] - pred_r
+        if obs_weight is not None:
+            resid_r = resid_r * obs_weight[r]
+        sse_per_b += resid_r ** 2
     return sse_per_b
