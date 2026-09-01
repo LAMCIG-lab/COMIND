@@ -5,6 +5,9 @@ from scipy.optimize import linear_sum_assignment
 import statsmodels.formula.api as smf
 from typing import Sequence
 
+SOLVE_SYSTEM_CALLS = 0
+
+
 def solve_system(
     x0: np.ndarray,
     f: np.ndarray,
@@ -36,6 +39,9 @@ def solve_system(
     np.ndarray
         Simulated biomarker trajectories of shape (n_biomarkers, len(t_span)).
     """
+    global SOLVE_SYSTEM_CALLS
+    SOLVE_SYSTEM_CALLS += 1
+
     if kappa is None:
         kappa = np.zeros(K.shape[0])
     K_eff = scalar_K * K + np.diag(kappa)

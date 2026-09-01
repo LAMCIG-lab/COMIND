@@ -908,7 +908,16 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         cog = flat["cog"]
         unique_ids = np.unique(ids)
 
-        state["current_s"], state["current_kappa"], state["current_scalar_K"] = (
+        # globals_trajectories is solved at the converged globals with this same
+        # cluster_f, so the E-step below can reuse it. Ordering dependency: the
+        # per-subtype fit_theta_cluster loop must stay AFTER the E-step, or this
+        # cache goes stale silently (wrong assignments, not a crash).
+        (
+            state["current_s"],
+            state["current_kappa"],
+            state["current_scalar_K"],
+            globals_trajectories,
+        ) = (
             fit_theta_globals(
                 X_obs=X_obs,
                 dt_obs=dt,
@@ -960,6 +969,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 rng=self.rng,
                 ode_method=self.ode_method,
                 obs_weight=flat["obs_weight"],
+                X_preds=globals_trajectories,
             )
             self.assignment_probabilities_ = probs
         else:
@@ -980,6 +990,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 self.lambda_cog,
                 ode_method=self.ode_method,
                 obs_weight=flat["obs_weight"],
+                X_preds=globals_trajectories,
             )
 
         for z in range(self.n_subtypes):

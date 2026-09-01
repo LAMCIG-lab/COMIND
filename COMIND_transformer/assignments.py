@@ -119,11 +119,22 @@ def update_assignments_hard(
     lambda_cog,
     ode_method="LSODA",
     obs_weight=None,
+    X_preds=None,
 ):
-    """Hard E-step: assign each patient to the subtype with minimum SSE."""
-    X_preds = precompute_trajectories(
-        cluster_f, K, t_span, scalar_K, kappa, ode_method=ode_method
-    )
+    """Hard E-step: assign each patient to the subtype with minimum SSE.
+
+    X_preds : list[np.ndarray], optional
+        Precomputed per-subtype trajectories (e.g. returned by
+        fit_theta_globals at its converged parameters) to avoid re-solving
+        the ODE. Only valid if cluster_f/scalar_K/kappa here match what
+        produced it exactly — if the caller's step order ever changes so that
+        cluster_f is updated between fit_theta_globals and this call, pass
+        None instead to force a fresh solve.
+    """
+    if X_preds is None:
+        X_preds = precompute_trajectories(
+            cluster_f, K, t_span, scalar_K, kappa, ode_method=ode_method
+        )
     sse = sse_matrix(
         X_obs, dt, ids, beta, X_preds, s, t_span,
         cog=cog, cluster_cog_a=cluster_cog_a, cluster_cog_b=cluster_cog_b,
@@ -152,11 +163,20 @@ def update_assignments_jitter(
     rng=None,
     ode_method="LSODA",
     obs_weight=None,
+    X_preds=None,
 ):
     """
     Sample assignments from softmax(-SSE / temperature).
 
     Uses reconstruction-only SSE (no cognitive term), matching the legacy jitter step.
+
+    X_preds : list[np.ndarray], optional
+        Precomputed per-subtype trajectories (e.g. returned by
+        fit_theta_globals at its converged parameters) to avoid re-solving
+        the ODE. Only valid if cluster_f/scalar_K/kappa here match what
+        produced it exactly — if the caller's step order ever changes so that
+        cluster_f is updated between fit_theta_globals and this call, pass
+        None instead to force a fresh solve.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -167,9 +187,10 @@ def update_assignments_jitter(
     assignments = np.zeros(n_patients, dtype=int)
     probabilities = np.zeros((n_patients, n_subtypes))
 
-    X_preds = precompute_trajectories(
-        cluster_f, K, t_span, scalar_K, kappa, ode_method=ode_method
-    )
+    if X_preds is None:
+        X_preds = precompute_trajectories(
+            cluster_f, K, t_span, scalar_K, kappa, ode_method=ode_method
+        )
 
     for p_idx, pid in enumerate(unique_ids):
         mask = ids == pid

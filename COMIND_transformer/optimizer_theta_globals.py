@@ -1,5 +1,7 @@
 import numpy as np
 from scipy.optimize import minimize
+from scipy.integrate import cumulative_simpson
+from scipy.interpolate import CubicSpline
 from .utils import solve_system
 from .sensitivity_lsoda import (
     integrate_all_sensitivities_lsoda,
@@ -207,7 +209,8 @@ def theta_s_loss_jac_exact_multi(
             u_b_at = interp_sensitivity_at_obs(u_kappa[b], t_span, t_k)
             grad_kappa[b] -= 2.0 * np.sum(res_k * s_factor * u_b_at)
 
-    grad_kappa += lambda_kappa * np.sign(kappa)
+    grad_kappa += lambda_kappa  # constant: penalty is lambda_kappa * sum(kappa) (kappa >= 0
+                                # via bounds, so this is already L1 — not sign-dependent).
 
     grad_scalar_K += _lognorm_scalar_K_grad(
         scalar_K_safe, lambda_scalar, scalar_K_center
@@ -292,11 +295,126 @@ def theta_s_loss_jac_rk4_multi(
             u_b_at = interp_sensitivity_at_obs(u_kappa[b], t_span, t_k)
             grad_kappa[b] -= 2.0 * np.sum(res_k * s_factor * u_b_at)
 
-    grad_kappa += lambda_kappa * np.sign(kappa)
+    grad_kappa += lambda_kappa  # constant: penalty is lambda_kappa * sum(kappa) (kappa >= 0
+                                # via bounds, so this is already L1 — not sign-dependent).
 
     grad_scalar_K += _lognorm_scalar_K_grad(
         scalar_K_safe, lambda_scalar, scalar_K_center
     )
+    grad = (
+        np.concatenate([grad_s, grad_kappa, [grad_scalar_K]])
+        if fit_s
+        else np.concatenate([grad_kappa, [grad_scalar_K]])
+    )
+    return loss, grad
+
+
+def theta_s_loss_jac_approx_multi(
+    params: np.ndarray,
+    t_obs: np.ndarray,
+    x_obs: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    cluster_f: list,
+    observation_assignments: np.ndarray,
+    lambda_s: float = 0.0,
+    lambda_scalar: float = 0.0,
+    lambda_kappa: float = 0.0,
+    scalar_K_center: float = SCALAR_K_CENTER,
+    fit_s: bool = True,
+    ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
+) -> tuple:
+    """
+    Cheap analytic-approx gradient for (s, kappa, scalar_K), mirroring the
+    cumulative_simpson trick already used for cluster f in
+    optimizer_theta_cluster.py.
+
+    Approximation: freezes x(t) at its unperturbed trajectory and keeps only
+    the *direct* RHS term for each parameter, dropping the feedback term
+    -diag(dx/dparam)(K_eff x + f):
+      - s:        exact (s doesn't enter the ODE, only scales output).
+      - kappa_i:  diagonal/self-region only (kappa_i enters region i's own
+                  equation as (1-x_i)*kappa_i*x_i; cross-region propagation
+                  of the perturbation is dropped — same approximation
+                  character as the f-cluster trick).
+      - scalar_K: full direct term (Kx already couples regions, so this
+                  naturally captures cross-region effects at t; only the
+                  feedback/recursive term is dropped).
+
+    Cheaper than finite differences: reuses the already-solved trajectory,
+    no extra ODE solves, just matrix multiplies + 1-D cumulative_simpson
+    quadratures.
+
+    ``obs_weight`` is handled inside ``_solve_and_residuals``, so masked
+    entries contribute zero to both loss and gradient.
+    """
+    s, kappa, scalar_K, x_list, _x_pred, residuals = _solve_and_residuals(
+        params, t_obs, x_obs, K, t_span, cluster_f, observation_assignments,
+        fit_s=fit_s,
+        ode_method=ode_method,
+        obs_weight=obs_weight,
+    )
+    n_biomarkers = x_obs.shape[1]
+    scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
+    lognorm_penalty = _lognorm_scalar_K_penalty(
+        scalar_K_safe, lambda_scalar, scalar_K_center
+    )
+    s_penalty = lambda_s * np.sum(s ** 2) if fit_s else 0.0
+    loss = (
+        np.sum(residuals ** 2)
+        + s_penalty
+        + lognorm_penalty
+        + lambda_kappa * np.sum(kappa)
+    )
+
+    grad_s = 2.0 * lambda_s * s.copy() if fit_s else None
+    grad_kappa = np.zeros(n_biomarkers)
+    grad_scalar_K = 0.0
+    s_factor = s[None, :] if fit_s else 1.0
+
+    for k, x_k in enumerate(x_list):
+        mask_k = observation_assignments == k
+        if not np.any(mask_k):
+            continue
+        t_k = np.clip(t_obs[mask_k], t_span[0], t_span[-1])
+        res_k = residuals[mask_k]
+
+        if fit_s:
+            x_at = np.vstack(
+                [np.interp(t_k, t_span, x_k[i]) for i in range(n_biomarkers)]
+            ).T  # (n_obs_k, p); exact: d(x_pred_i)/d(s_i) = x_i(t)
+            grad_s -= 2.0 * np.sum(res_k * x_at, axis=0)
+
+        Kx_k = K @ x_k  # (p, T)
+
+        u_scalarK_at = np.zeros((len(t_k), n_biomarkers))
+        u_kappa_at = np.zeros((len(t_k), n_biomarkers))
+        for i in range(n_biomarkers):
+            cum_scalarK = cumulative_simpson(
+                (1 - x_k[i]) * Kx_k[i], x=t_span, initial=0
+            )
+            u_scalarK_at[:, i] = CubicSpline(
+                t_span, cum_scalarK, extrapolate=False
+            )(t_k)
+
+            cum_kappa = cumulative_simpson(
+                (1 - x_k[i]) * x_k[i], x=t_span, initial=0
+            )
+            u_kappa_at[:, i] = CubicSpline(
+                t_span, cum_kappa, extrapolate=False
+            )(t_k)
+
+        grad_scalar_K -= 2.0 * np.sum(res_k * s_factor * u_scalarK_at)
+        # diagonal only: column i of u_kappa_at pairs with residual column i
+        grad_kappa -= 2.0 * np.sum(res_k * s_factor * u_kappa_at, axis=0)
+
+    grad_kappa += lambda_kappa  # constant: penalty is lambda_kappa * sum(kappa) (kappa >= 0
+                                # via bounds, so this is already L1 — not sign-dependent).
+    grad_scalar_K += _lognorm_scalar_K_grad(
+        scalar_K_safe, lambda_scalar, scalar_K_center
+    )
+
     grad = (
         np.concatenate([grad_s, grad_kappa, [grad_scalar_K]])
         if fit_s
@@ -335,10 +453,21 @@ def fit_theta_globals(
         optimize only (kappa, scalar_K).
 
     method:
-        'lbfgs_approx' — L-BFGS-B, jac=False (SciPy finite-difference gradient).
+        'lbfgs_approx' — L-BFGS-B, jac=True, cheap analytic-approx gradient
+                         (cumulative_simpson direct-term trick; drops the
+                         sensitivity feedback term and, for kappa, cross-region
+                         coupling — see theta_s_loss_jac_approx_multi).
         'lbfgs_exact'  — L-BFGS-B, jac=True, exact sensitivities solved with LSODA.
         'lbfgs_rk4'    — L-BFGS-B, jac=True, sensitivities via RK4 on t_span.
         'nelder_mead'  — derivative-free, loss only.
+
+    Returns
+    -------
+    s_fit, kappa_fit, scalar_K_fit : fitted globals.
+    trajectories : list of per-subtype (n_biomarkers, len(t_span)) arrays,
+        solved at the converged parameters. Callers can pass these straight
+        into the E-step to avoid re-solving the identical ODE system, but
+        only while ``cluster_f`` is unchanged.
     """
     t_pred = dt_obs + beta_pred[ids]
     n_biomarkers = X_obs.shape[1]
@@ -368,7 +497,7 @@ def fit_theta_globals(
     elif method == "lbfgs_rk4":
         loss_fn, scipy_method, use_jac = theta_s_loss_jac_rk4_multi, "L-BFGS-B", True
     elif method == "lbfgs_approx":
-        loss_fn, scipy_method, use_jac = theta_s_loss_multi, "L-BFGS-B", False
+        loss_fn, scipy_method, use_jac = theta_s_loss_jac_approx_multi, "L-BFGS-B", True
     elif method == "nelder_mead":
         loss_fn, scipy_method, use_jac = theta_s_loss_multi, "Nelder-Mead", False
     else:
@@ -420,4 +549,15 @@ def fit_theta_globals(
         kappa_fit = fitted_params[:-1]
         scalar_K_fit = fitted_params[-1]
 
-    return s_fit, kappa_fit, scalar_K_fit
+    # Solve once at the converged point and hand the trajectories back so
+    # callers (the E-step) don't have to re-solve the identical ODE system.
+    x0 = np.zeros(n_biomarkers)
+    trajectories = [
+        solve_system(
+            x0, np.ravel(cluster_f[z]), K, t_span, scalar_K_fit, kappa_fit,
+            ode_method=ode_method,
+        )
+        for z in range(len(cluster_f))
+    ]
+
+    return s_fit, kappa_fit, scalar_K_fit, trajectories
