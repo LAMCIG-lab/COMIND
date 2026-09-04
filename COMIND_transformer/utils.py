@@ -97,6 +97,39 @@ def solve_system(
         y_out[b] = np.interp(t_span, sol.t, y[b], left=y[b, 0], right=y[b, -1])
     return y_out
 
+
+def split_observed(X_obs):
+    """
+    Split a (possibly NaN-containing) observation array into a finite
+    placeholder array and an elementwise observation weight.
+
+    Parameters
+    ----------
+    X_obs : array-like
+        Observed biomarker values, shape (n_rows, n_biomarkers). Missing
+        entries are indicated by NaN (or any non-finite value).
+
+    Returns
+    -------
+    X_filled : ndarray
+        Copy of ``X_obs`` with non-finite entries replaced by 0.0.
+    obs_weight : ndarray
+        Same shape as ``X_obs``, 1.0 where ``X_obs`` is finite, 0.0 otherwise.
+
+    Implementation: multiply every residual by ``obs_weight`` before
+    summing. Residuals MUST be computed on ``X_filled``, then weighted —
+    never the reverse (0 * NaN is NaN in IEEE754). The placeholder 0.0
+    never affects results because it is always paired with weight 0.0.
+
+    a patient can have one biomarker missing at one visit while everything else
+    at that visit is used normally. Assumes missingness is MAR/MCAR 
+    """
+    X_obs = np.asarray(X_obs, dtype=float)
+    obs_weight = np.isfinite(X_obs).astype(float)
+    X_filled = np.where(obs_weight > 0, X_obs, 0.0)
+    return X_filled, obs_weight
+
+
 def initialize_beta(ids: np.ndarray, beta_range: tuple = (0, 12), rng: np.random.Generator = None) -> np.ndarray:
     """
     Uniformly randomly initialize beta values for each unique patient ID.
