@@ -1,30 +1,0 @@
-PBS_JOBID=24246[1].orpheus.iit.edu
-PBS_ARRAYID=1
-=== Experiment: example_dummy_experiment ===
-candidate: 1
-Loaded /home/dsemchin/COMIND/experiment_pipeline/example_dummy_experiment/dummy_clean.csv: (300, 10)
-Patients: 100, biomarkers: 5
-K aligned: (5, 5), 0 disconnected: []
-Train: 80 patients, Val: 20 patients
-Grid: 1 hyper combos x 4 n_subtypes = 4 total candidates
-
-=== Candidate 1 (n_subtypes=2) ===
-  lambda_f: 10.0
-  lambda_kappa: 5.0
-  lambda_cog: 0.0
-  lambda_scalar: 10.0
-  scalar_K_center: 1.0
-  lambda_jsd: 50.0
-  lambda_beta: 0.0
-  n_subtypes: 2
-  0%|          | 0/100 [00:00<?, ?it/s]  1%|1         | 1/100 [00:04<07:02,  4.27s/it]Checkpoint (progress): /home/dsemchin/COMIND/experiment_pipeline/example_dummy_experiment/results/checkpoint_1.npz  (outer iter 1, LSE 1.88391)
-  2%|2         | 2/100 [00:08<06:30,  3.99s/it]Checkpoint (progress): /home/dsemchin/COMIND/experiment_pipeline/example_dummy_experiment/results/checkpoint_1.npz  (outer iter 2, LSE 1.88386)
-  3%|3         | 3/100 [00:11<05:48,  3.59s/it]Checkpoint (progress): /home/dsemchin/COMIND/experiment_pipeline/example_dummy_experiment/results/checkpoint_1.npz  (outer iter 3, LSE 1.88212)
-  4%|4         | 4/100 [00:13<05:01,  3.14s/it]Checkpoint (progress): /home/dsemchin/COMIND/experiment_pipeline/example_dummy_experiment/results/checkpoint_1.npz  (outer iter 4, LSE 1.88204)
-EM: LSE did not improve vs best (1.88204); trial=1.88258. Exiting early at outer iter 4.
-  4%|4         | 4/100 [00:16<06:28,  4.04s/it]
-Checkpoint (complete): /home/dsemchin/COMIND/experiment_pipeline/example_dummy_experiment/results/checkpoint_1.npz  (outer iter 4, LSE 1.88204)
-Estimating beta and subtype assignments:   0%|          | 0/20 [00:00<?, ?it/s]Estimating beta and subtype assignments:  35%|###5      | 7/20 [00:00<00:00, 64.16it/s]Estimating beta and subtype assignments:  70%|#######   | 14/20 [00:00<00:00, 64.16it/s]Estimating beta and subtype assignments: 100%|##########| 20/20 [00:00<00:00, 63.91it/s]
-
-Saved: /home/dsemchin/COMIND/experiment_pipeline/example_dummy_experiment/results/result_001_lambda_f10p000_lambda_kappa5p000_lambda_cog0p000_lambda_scalar10p000_scalar_K_center1p000_lambda_jsd50p000_lambda_beta0p000_n_subtypes2.npz
-Final LSE: 1.882040, BIC: 2384.6926, val LSE: 0.504940

@@ -28,3 +28,5 @@ notebooks/ppmi_filter_2.ipynb
 # Experiment array outputs (keep templates; ignore run artifacts)
 experiment_pipeline/**/results/
 experiment_pipeline/**/logs/
+experiment_pipeline/
+dpmost_for_emile/
