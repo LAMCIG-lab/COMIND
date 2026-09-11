@@ -45,6 +45,48 @@ def _lognorm_scalar_K_grad(
     )
 
 
+def resolve_s_mask(n_biomarkers: int, fit_s: bool = True, s_mask=None) -> np.ndarray:
+    """Boolean mask of which ``s`` entries are free (True) vs held at 1 (False).
+
+    ``fit_s=False`` fixes every entry. ``s_mask is None`` with ``fit_s=True``
+    leaves every entry free (legacy behavior).
+    """
+    if not fit_s:
+        return np.zeros(n_biomarkers, dtype=bool)
+    if s_mask is None:
+        return np.ones(n_biomarkers, dtype=bool)
+    mask = np.asarray(s_mask, dtype=bool).ravel()
+    if mask.shape != (n_biomarkers,):
+        raise ValueError(
+            f"s_mask must have shape ({n_biomarkers},), got {mask.shape}"
+        )
+    return mask
+
+
+def _unpack_globals(params: np.ndarray, n_biomarkers: int, s_mask: np.ndarray):
+    """Unpack (s, kappa, scalar_K); masked-off ``s`` entries are held at 1."""
+    s = np.ones(n_biomarkers, dtype=float)
+    n_free = int(np.count_nonzero(s_mask))
+    if n_free:
+        s[s_mask] = params[:n_free]
+        kappa = params[n_free:-1]
+    else:
+        kappa = params[:-1]
+    return s, kappa, float(params[-1])
+
+
+def _pack_global_grad(grad_s, grad_kappa, grad_scalar_K, s_mask: np.ndarray) -> np.ndarray:
+    if np.any(s_mask):
+        return np.concatenate([grad_s[s_mask], grad_kappa, [grad_scalar_K]])
+    return np.concatenate([grad_kappa, [grad_scalar_K]])
+
+
+def _s_ridge_penalty(s: np.ndarray, lambda_s: float, s_mask: np.ndarray) -> float:
+    if lambda_s == 0.0 or not np.any(s_mask):
+        return 0.0
+    return float(lambda_s * np.sum(s[s_mask] ** 2))
+
+
 def _solve_and_residuals(
     params: np.ndarray,
     t_obs: np.ndarray,
@@ -56,22 +98,21 @@ def _solve_and_residuals(
     fit_s: bool = True,
     ode_method: str = "LSODA",
     obs_weight: np.ndarray = None,
+    s_mask=None,
 ):
     """Unpack globals, solve subtype trajectories, build x_pred and residuals.
 
     ``obs_weight`` is an optional (n_rows, n_biomarkers) array (1.0 =
     observed, 0.0 = missing). Residuals are masked here so every caller
     gets pre-masked residuals. ``None`` treats every entry as observed.
+
+    ``s_mask`` is an optional boolean vector (True = optimize that ``s``
+    entry, False = hold it at 1). Packed ``params`` contain only free
+    ``s`` entries, then kappa, then scalar_K.
     """
     n_biomarkers = x_obs.shape[1]
-    if fit_s:
-        s = params[:n_biomarkers]
-        kappa = params[n_biomarkers:-1]
-        scalar_K = params[-1]
-    else:
-        s = np.ones(n_biomarkers)
-        kappa = params[:-1]
-        scalar_K = params[-1]
+    s_mask_bool = resolve_s_mask(n_biomarkers, fit_s, s_mask)
+    s, kappa, scalar_K = _unpack_globals(params, n_biomarkers, s_mask_bool)
     x0 = np.zeros(n_biomarkers)
     n_subtypes = len(cluster_f)
 
@@ -114,6 +155,7 @@ def theta_s_loss_multi(
     fit_s: bool = True,
     ode_method: str = "LSODA",
     obs_weight: np.ndarray = None,
+    s_mask=None,
 ) -> float:
     """
     Loss for s and scalar_K when each observation uses its assigned subtype's f.
@@ -124,12 +166,14 @@ def theta_s_loss_multi(
         fit_s=fit_s,
         ode_method=ode_method,
         obs_weight=obs_weight,
+        s_mask=s_mask,
     )
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
     lognorm_penalty = _lognorm_scalar_K_penalty(
         scalar_K_safe, lambda_scalar, scalar_K_center
     )
-    s_penalty = lambda_s * np.sum(s ** 2) if fit_s else 0.0
+    s_mask_bool = resolve_s_mask(x_obs.shape[1], fit_s, s_mask)
+    s_penalty = _s_ridge_penalty(s, lambda_s, s_mask_bool)
     return (
         np.sum(residuals ** 2)
         + s_penalty
@@ -153,6 +197,7 @@ def theta_s_loss_jac_exact_multi(
     fit_s: bool = True,
     ode_method: str = "LSODA",
     obs_weight: np.ndarray = None,
+    s_mask=None,
 ) -> tuple:
     """
     Same loss as theta_s_loss_multi; gradients via sensitivity IVPs integrated
@@ -163,13 +208,16 @@ def theta_s_loss_jac_exact_multi(
         fit_s=fit_s,
         ode_method=ode_method,
         obs_weight=obs_weight,
+        s_mask=s_mask,
     )
     n_biomarkers = x_obs.shape[1]
+    s_mask_bool = resolve_s_mask(n_biomarkers, fit_s, s_mask)
+    any_s = bool(np.any(s_mask_bool))
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
     lognorm_penalty = _lognorm_scalar_K_penalty(
         scalar_K_safe, lambda_scalar, scalar_K_center
     )
-    s_penalty = lambda_s * np.sum(s ** 2) if fit_s else 0.0
+    s_penalty = _s_ridge_penalty(s, lambda_s, s_mask_bool)
     loss = (
         np.sum(residuals ** 2)
         + s_penalty
@@ -187,10 +235,10 @@ def theta_s_loss_jac_exact_multi(
         u_kappa = [U_k[:, b + 1, :] for b in range(n_biomarkers)]
         sens_records.append((x_k, u_sk, u_kappa))
 
-    grad_s = 2.0 * lambda_s * s.copy() if fit_s else None
+    grad_s = 2.0 * lambda_s * s.copy() if any_s else None
     grad_kappa = np.zeros(n_biomarkers)
     grad_scalar_K = 0.0
-    s_factor = s[None, :] if fit_s else 1.0  # no-op factor when s is fixed at ones
+    s_factor = s[None, :]
 
     for k, (x_k, u_sk, u_kappa) in enumerate(sens_records):
         mask_k = observation_assignments == k
@@ -201,7 +249,7 @@ def theta_s_loss_jac_exact_multi(
 
         x_at = interp_sensitivity_at_obs(x_k, t_span, t_k)
         u_sk_at = interp_sensitivity_at_obs(u_sk, t_span, t_k)
-        if fit_s:
+        if any_s:
             grad_s -= 2.0 * np.sum(res_k * x_at, axis=0)
         grad_scalar_K -= 2.0 * np.sum(res_k * s_factor * u_sk_at)
 
@@ -215,12 +263,7 @@ def theta_s_loss_jac_exact_multi(
     grad_scalar_K += _lognorm_scalar_K_grad(
         scalar_K_safe, lambda_scalar, scalar_K_center
     )
-    grad = (
-        np.concatenate([grad_s, grad_kappa, [grad_scalar_K]])
-        if fit_s
-        else np.concatenate([grad_kappa, [grad_scalar_K]])
-    )
-    return loss, grad
+    return loss, _pack_global_grad(grad_s, grad_kappa, grad_scalar_K, s_mask_bool)
 
 
 def theta_s_loss_jac_rk4_multi(
@@ -238,6 +281,7 @@ def theta_s_loss_jac_rk4_multi(
     fit_s: bool = True,
     ode_method: str = "LSODA",
     obs_weight: np.ndarray = None,
+    s_mask=None,
 ) -> tuple:
     """
     Same loss as theta_s_loss_multi; gradients via RK4 sensitivities on t_span.
@@ -247,13 +291,16 @@ def theta_s_loss_jac_rk4_multi(
         fit_s=fit_s,
         ode_method=ode_method,
         obs_weight=obs_weight,
+        s_mask=s_mask,
     )
     n_biomarkers = x_obs.shape[1]
+    s_mask_bool = resolve_s_mask(n_biomarkers, fit_s, s_mask)
+    any_s = bool(np.any(s_mask_bool))
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
     lognorm_penalty = _lognorm_scalar_K_penalty(
         scalar_K_safe, lambda_scalar, scalar_K_center
     )
-    s_penalty = lambda_s * np.sum(s ** 2) if fit_s else 0.0
+    s_penalty = _s_ridge_penalty(s, lambda_s, s_mask_bool)
     loss = (
         np.sum(residuals ** 2)
         + s_penalty
@@ -273,10 +320,10 @@ def theta_s_loss_jac_rk4_multi(
         u_kappa = [U_k[:, b + 1, :] for b in range(n_biomarkers)]
         sens_records.append((x_k, u_sk, u_kappa))
 
-    grad_s = 2.0 * lambda_s * s.copy() if fit_s else None
+    grad_s = 2.0 * lambda_s * s.copy() if any_s else None
     grad_kappa = np.zeros(n_biomarkers)
     grad_scalar_K = 0.0
-    s_factor = s[None, :] if fit_s else 1.0  # no-op factor when s is fixed at ones
+    s_factor = s[None, :]
 
     for k, (x_k, u_sk, u_kappa) in enumerate(sens_records):
         mask_k = observation_assignments == k
@@ -287,7 +334,7 @@ def theta_s_loss_jac_rk4_multi(
 
         x_at = interp_sensitivity_at_obs(x_k, t_span, t_k)
         u_sk_at = interp_sensitivity_at_obs(u_sk, t_span, t_k)
-        if fit_s:
+        if any_s:
             grad_s -= 2.0 * np.sum(res_k * x_at, axis=0)
         grad_scalar_K -= 2.0 * np.sum(res_k * s_factor * u_sk_at)
 
@@ -301,12 +348,7 @@ def theta_s_loss_jac_rk4_multi(
     grad_scalar_K += _lognorm_scalar_K_grad(
         scalar_K_safe, lambda_scalar, scalar_K_center
     )
-    grad = (
-        np.concatenate([grad_s, grad_kappa, [grad_scalar_K]])
-        if fit_s
-        else np.concatenate([grad_kappa, [grad_scalar_K]])
-    )
-    return loss, grad
+    return loss, _pack_global_grad(grad_s, grad_kappa, grad_scalar_K, s_mask_bool)
 
 
 def theta_s_loss_jac_approx_multi(
@@ -324,6 +366,7 @@ def theta_s_loss_jac_approx_multi(
     fit_s: bool = True,
     ode_method: str = "LSODA",
     obs_weight: np.ndarray = None,
+    s_mask=None,
 ) -> tuple:
     """
     Cheap analytic-approx gradient for (s, kappa, scalar_K), mirroring the
@@ -354,13 +397,16 @@ def theta_s_loss_jac_approx_multi(
         fit_s=fit_s,
         ode_method=ode_method,
         obs_weight=obs_weight,
+        s_mask=s_mask,
     )
     n_biomarkers = x_obs.shape[1]
+    s_mask_bool = resolve_s_mask(n_biomarkers, fit_s, s_mask)
+    any_s = bool(np.any(s_mask_bool))
     scalar_K_safe = max(scalar_K, SCALAR_K_MIN)
     lognorm_penalty = _lognorm_scalar_K_penalty(
         scalar_K_safe, lambda_scalar, scalar_K_center
     )
-    s_penalty = lambda_s * np.sum(s ** 2) if fit_s else 0.0
+    s_penalty = _s_ridge_penalty(s, lambda_s, s_mask_bool)
     loss = (
         np.sum(residuals ** 2)
         + s_penalty
@@ -368,10 +414,10 @@ def theta_s_loss_jac_approx_multi(
         + lambda_kappa * np.sum(kappa)
     )
 
-    grad_s = 2.0 * lambda_s * s.copy() if fit_s else None
+    grad_s = 2.0 * lambda_s * s.copy() if any_s else None
     grad_kappa = np.zeros(n_biomarkers)
     grad_scalar_K = 0.0
-    s_factor = s[None, :] if fit_s else 1.0
+    s_factor = s[None, :]
 
     for k, x_k in enumerate(x_list):
         mask_k = observation_assignments == k
@@ -380,7 +426,7 @@ def theta_s_loss_jac_approx_multi(
         t_k = np.clip(t_obs[mask_k], t_span[0], t_span[-1])
         res_k = residuals[mask_k]
 
-        if fit_s:
+        if any_s:
             x_at = np.vstack(
                 [np.interp(t_k, t_span, x_k[i]) for i in range(n_biomarkers)]
             ).T  # (n_obs_k, p); exact: d(x_pred_i)/d(s_i) = x_i(t)
@@ -415,12 +461,7 @@ def theta_s_loss_jac_approx_multi(
         scalar_K_safe, lambda_scalar, scalar_K_center
     )
 
-    grad = (
-        np.concatenate([grad_s, grad_kappa, [grad_scalar_K]])
-        if fit_s
-        else np.concatenate([grad_kappa, [grad_scalar_K]])
-    )
-    return loss, grad
+    return loss, _pack_global_grad(grad_s, grad_kappa, grad_scalar_K, s_mask_bool)
 
 
 def fit_theta_globals(
@@ -444,13 +485,19 @@ def fit_theta_globals(
     strict_tol: bool = False,
     ode_method: str = "LSODA",
     obs_weight: np.ndarray = None,
+    s_mask=None,
 ) -> tuple:
     """
     Optimizes global (s, kappa, scalar_K) using assignment-aware subtype trajectories.
 
     fit_s:
-        If True (default), optimize per-biomarker s. If False, fix s=ones and
-        optimize only (kappa, scalar_K).
+        If True (default), optimize per-biomarker s (subject to ``s_mask``).
+        If False, fix every s entry at 1 and optimize only (kappa, scalar_K).
+
+    s_mask:
+        Optional boolean vector of length n_biomarkers. True = optimize that
+        s entry; False = hold it at 1. Ignored when ``fit_s`` is False.
+        ``None`` (default) leaves every entry free when ``fit_s`` is True.
 
     method:
         'lbfgs_approx' — L-BFGS-B, jac=True, cheap analytic-approx gradient
@@ -471,18 +518,29 @@ def fit_theta_globals(
     """
     t_pred = dt_obs + beta_pred[ids]
     n_biomarkers = X_obs.shape[1]
+    s_mask_bool = resolve_s_mask(n_biomarkers, fit_s, s_mask)
+    n_free_s = int(np.count_nonzero(s_mask_bool))
 
     if scalar_K_guess is None:
         scalar_K_guess = 1.0
     if kappa_guess is None:
         kappa_guess = np.zeros(K.shape[0])
+    if s_guess is None:
+        s_guess = np.ones(n_biomarkers)
+    else:
+        s_guess = np.asarray(s_guess, dtype=float).ravel().copy()
+        if s_guess.shape != (n_biomarkers,):
+            raise ValueError(
+                f"s_guess must have shape ({n_biomarkers},), got {s_guess.shape}"
+            )
+    s_guess[~s_mask_bool] = 1.0
 
-    if fit_s:
-        if s_guess is None:
-            s_guess = np.ones(n_biomarkers)
-        initial_params = np.concatenate([s_guess, kappa_guess, [scalar_K_guess]])
+    if n_free_s:
+        initial_params = np.concatenate(
+            [s_guess[s_mask_bool], kappa_guess, [scalar_K_guess]]
+        )
         bounds = (
-            [(0.0, np.inf)] * n_biomarkers
+            [(0.0, np.inf)] * n_free_s
             + [(0.0, np.inf)] * n_biomarkers
             + [(0.0, np.inf)]
         )
@@ -520,6 +578,7 @@ def fit_theta_globals(
         fit_s,
         ode_method,
         obs_weight,
+        s_mask_bool,
     )
 
     minimize_kwargs = dict(
@@ -539,15 +598,9 @@ def fit_theta_globals(
 
     result = minimize(**minimize_kwargs)
 
-    fitted_params = result.x
-    if fit_s:
-        s_fit = fitted_params[:n_biomarkers]
-        kappa_fit = fitted_params[n_biomarkers:-1]
-        scalar_K_fit = fitted_params[-1]
-    else:
-        s_fit = np.ones(n_biomarkers)
-        kappa_fit = fitted_params[:-1]
-        scalar_K_fit = fitted_params[-1]
+    s_fit, kappa_fit, scalar_K_fit = _unpack_globals(
+        result.x, n_biomarkers, s_mask_bool
+    )
 
     # Solve once at the converged point and hand the trajectories back so
     # callers (the E-step) don't have to re-solve the identical ODE system.
