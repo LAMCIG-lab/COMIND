@@ -4,12 +4,22 @@ import numpy as np
 
 from .utils import solve_system
 
-def count_bic_params(final_s, final_kappa, cluster_f, n_subtypes, lambda_cog, cluster_cog_a=None, fit_s=True):
+def count_bic_params(
+    final_s,
+    final_kappa,
+    cluster_f,
+    n_subtypes,
+    lambda_cog,
+    cluster_cog_a=None,
+    fit_s=True,
+    s_mask=None,
+):
     """
     Count free model parameters for BIC.
 
     Parameter groups:
-      - n_biomarkers entries of s
+      - free entries of s (all n_biomarkers if fit_s and s_mask is None;
+        only True entries of s_mask otherwise; none if fit_s is False)
       - active kappa entries (|kappa_b| >= 0.01)
       - 1 global scalar_K
       - per-subtype cognitive regression (cog_a + cog_b) if lambda_cog > 0
@@ -23,6 +33,9 @@ def count_bic_params(final_s, final_kappa, cluster_f, n_subtypes, lambda_cog, cl
     n_subtypes    : int
     lambda_cog    : float
     cluster_cog_a : list[(n_cog,)] or None
+    fit_s         : bool
+    s_mask        : (n_biomarkers,) bool or None
+        True = that s entry is a free parameter. Ignored when fit_s is False.
 
     Returns
     -------
@@ -34,7 +47,10 @@ def count_bic_params(final_s, final_kappa, cluster_f, n_subtypes, lambda_cog, cl
     kappa_active = int(np.sum(np.abs(final_kappa) >= threshold))
     k = kappa_active + 1                    # active kappa + scalar_K
     if fit_s:
-        k += n_biomarkers                   # per-biomarker supremum s
+        if s_mask is None:
+            k += n_biomarkers               # per-biomarker supremum s
+        else:
+            k += int(np.sum(np.asarray(s_mask, dtype=bool)))
 
     if lambda_cog > 0 and cluster_cog_a:
         n_cog = np.asarray(cluster_cog_a[0]).shape[0]

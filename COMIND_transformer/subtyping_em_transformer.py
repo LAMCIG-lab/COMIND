@@ -43,7 +43,7 @@ from .model_selection import (
     count_bic_params,
     compute_bic,
 )
-from .optimizer_theta_globals import fit_theta_globals
+from .optimizer_theta_globals import fit_theta_globals, resolve_s_mask
 from .optimizer_theta_cluster import fit_theta_cluster
 from .optimizer_beta import estimate_beta, reconstruction_sse
 from .optimizer_cognitive_regression import fit_linear_cog_regression_multi
@@ -103,6 +103,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     ``initial_kappa``, ``initial_assignments``, per-subtype cognitive params,
     ``initial_beta``, or use
     :func:`COMIND_transformer.warm_start.load_warm_start_from_npz`.
+
+    ``s_mask`` (optional boolean vector): True = optimize that biomarker's
+    scale ``s``; False = hold it at 1. Use this for ceiling-normalized
+    clinical scores whose scale is already known. ``fit_s=False`` fixes
+    every entry regardless of ``s_mask``.
     """
 
     def __init__(
@@ -120,6 +125,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         lambda_beta: float = 0.0,
         lambda_kappa: float = 0.0,
         fit_s: bool = True,
+        s_mask: np.ndarray = None,
         initial_f: np.ndarray = None,
         initial_s: np.ndarray = None,
         initial_scalar_K: float = None,
@@ -158,6 +164,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.lambda_beta = lambda_beta
         self.lambda_kappa = lambda_kappa
         self.fit_s = fit_s
+        self.s_mask = s_mask
 
         self.initial_f = initial_f
         self.initial_s = initial_s
@@ -675,6 +682,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         else:
             s = rng.uniform(0.1, 3, size=n_biomarkers)
 
+        s_mask_bool = resolve_s_mask(n_biomarkers, self.fit_s, self.s_mask)
+        s[~s_mask_bool] = 1.0
+        self.s_mask_ = s_mask_bool
+
         scalar_K = (
             float(self.initial_scalar_K)
             if self.initial_scalar_K is not None
@@ -934,6 +945,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 lambda_kappa=self.lambda_kappa,
                 scalar_K_center=self.scalar_K_center,
                 fit_s=self.fit_s,
+                s_mask=self.s_mask_,
                 assignments=state["assignments"],
                 cluster_f=state["cluster_f"],
                 strict_tol=self.strict_tol,
@@ -1158,6 +1170,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.n_subtypes,
             self.lambda_cog,
             self.cluster_cog_a,
+            fit_s=self.fit_s,
+            s_mask=getattr(self, "s_mask_", self.s_mask),
         )
         self.bic_n_params_ = k
         self.bic_ = compute_bic(
@@ -1178,6 +1192,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.n_subtypes,
             self.lambda_cog,
             self.cluster_cog_a,
+            fit_s=self.fit_s,
+            s_mask=getattr(self, "s_mask_", self.s_mask),
         )
 
     @staticmethod
