@@ -540,6 +540,8 @@ def fit_theta_globals(
             [s_guess[s_mask_bool], kappa_guess, [scalar_K_guess]]
         )
         bounds = (
+
+            # TODO: change s to be top bounded by 1/max(biom value)
             [(0.0, np.inf)] * n_free_s
             + [(0.0, np.inf)] * n_biomarkers
             + [(0.0, np.inf)]

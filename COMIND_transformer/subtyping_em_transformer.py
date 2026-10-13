@@ -562,8 +562,15 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         return results
 
     def score(self, X: list, y=None) -> float:
-        """Negative reconstruction LSE on X (higher = better, for sklearn CV)."""
-        return -self._compute_val_score(X, self.transform(X)["beta"])
+        """Negative per-subtype reconstruction LSE on X (higher = better, for sklearn CV).
+
+        Each patient is scored on the trajectory of the subtype ``transform`` assigns,
+        not on a single shared curve.
+        """
+        transformed = self.transform(X)
+        return -self._compute_val_score(
+            X, transformed["beta"], transformed["subtype"]
+        )
 
     def compute_subtype_mapping(self, true_f_list, verbose=True):
         """Compute fitted→true subtype mapping by nearest-f matching."""
@@ -1321,24 +1328,50 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 [state["cluster_cog_a"][z], [state["cluster_cog_b"][z]]]
             )
 
-    def _compute_val_score(self, X, beta):
-        """Reconstruction LSE on validation set X given beta estimates."""
+    def _compute_val_score(self, X, beta, assignments=None):
+        """Reconstruction LSE on X. Each patient uses their assigned subtype trajectory.
+
+        ``assignments`` indexes ``cluster_f``. If omitted, the assignments stored by
+        the most recent ``transform`` call are used.
+        """
+        if assignments is None:
+            assignments = getattr(self, "transform_assignments", None)
+        if assignments is None:
+            raise ValueError(
+                "assignments are required. Pass them explicitly, or call transform() first."
+            )
+        assignments = np.asarray(assignments, dtype=int)
+        beta = np.asarray(beta, dtype=float)
+        if len(assignments) != len(X) or len(beta) != len(X):
+            raise ValueError(
+                f"beta and assignments must have one entry per patient "
+                f"(len(X)={len(X)}, len(beta)={len(beta)}, len(assignments)={len(assignments)})"
+            )
+
         n_biomarkers = X[0]["X_obs"].shape[1]
-        f = self.theta[:n_biomarkers]
-        s = self.theta[n_biomarkers : 2 * n_biomarkers]
-        scalar_K = self.theta[-1]
-        X_pred = solve_system(
-            np.zeros(n_biomarkers), f, self.K, self.t_span, scalar_K, self.final_kappa
-        )
+        X_preds = [
+            solve_system(
+                np.zeros(n_biomarkers),
+                np.ravel(self.cluster_f[z]),
+                self.K,
+                self.t_span,
+                self.final_scalar_K,
+                self.final_kappa,
+                ode_method=self.ode_method,
+            )
+            for z in range(self.n_subtypes)
+        ]
         lse = 0.0
         for i, p in enumerate(X):
+            z = int(assignments[i])
             X_obs_i, obs_weight_i = split_observed(p["X_obs"])
-            tp = beta[i] + p["dt"]
-            X_interp = np.vstack(
-                [
-                    np.interp(tp, self.t_span, X_pred[b]) * s[b]
-                    for b in range(n_biomarkers)
-                ]
-            ).T
-            lse += np.sum(((X_obs_i - X_interp) * obs_weight_i) ** 2)
+            lse += reconstruction_sse(
+                float(beta[i]),
+                X_obs_i,
+                np.asarray(p["dt"]),
+                X_preds[z],
+                self.t_span,
+                self.final_s,
+                obs_weight_i=obs_weight_i,
+            )
         return lse

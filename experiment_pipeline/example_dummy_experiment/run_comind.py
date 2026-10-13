@@ -157,7 +157,7 @@ subtyping_em.fit(X_train, checkpoint_path=checkpoint_path)
 transform_results = subtyping_em.transform(X_val, use_cognitive_prior=False)
 beta_val = transform_results["beta"]
 val_assignments = transform_results["subtype"]
-val_lse = subtyping_em._compute_val_score(X_val, beta_val)
+val_lse = subtyping_em._compute_val_score(X_val, beta_val, val_assignments)
 
 # 7. Save literally everything
 bic_value = subtyping_em.bic_
