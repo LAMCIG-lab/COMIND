@@ -56,6 +56,9 @@ from .utils import (
 )
 
 
+_BACKENDS = {"numpy", "jax"}
+
+
 def _lse_improvement_acceptable(best, lse_val, eps, rel_tol):
     """True when the trial LSE improves enough over the running best."""
     if not np.isfinite(lse_val):
@@ -108,6 +111,15 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     scale ``s``; False = hold it at 1. Use this for ceiling-normalized
     clinical scores whose scale is already known. ``fit_s=False`` fixes
     every entry regardless of ``s_mask``.
+
+    ``backend="jax"`` replaces the globals, E-step, cluster-f and beta steps
+    with JAX versions (RK4 forward solve on ``t_span``, exact reverse-mode
+    gradients, scipy L-BFGS-B). ``theta_solver_stages`` is ignored: each
+    outer iteration runs exactly one stage. Cognitive regression, BIC,
+    checkpointing, ``transform`` and ``transform_soft`` stay NumPy/LSODA, so
+    the final BIC is an LSODA consistency check on the JAX-fitted parameters.
+    Pass the same ``jax_pad_rows`` / ``jax_pad_patients`` to every CV fold so
+    all folds share one compiled function. Requires ``pip install "jax[cpu]"``.
     """
 
     def __init__(
@@ -149,6 +161,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         kappa_anneal_strength: float = 0.05,
         f_anneal_strength: float = 0.01,
         anneal_decay: float = 0.7,
+        backend: str = "numpy",
+        jax_pad_rows: int = None,
+        jax_pad_patients: int = None,
     ):
         self.max_iter = max_iter
         self.t_max = t_max
@@ -196,6 +211,16 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.kappa_anneal_strength = kappa_anneal_strength
         self.f_anneal_strength = f_anneal_strength
         self.anneal_decay = anneal_decay
+        self.backend = backend
+        self.jax_pad_rows = jax_pad_rows
+        self.jax_pad_patients = jax_pad_patients
+        self._validate_backend()
+
+    def _validate_backend(self):
+        if self.backend not in _BACKENDS:
+            raise ValueError(
+                f"backend must be one of {sorted(_BACKENDS)}, got {self.backend!r}"
+            )
 
     def fit(self, X: list, y=None, checkpoint_path=None):
         """
@@ -208,6 +233,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             iteration (for recovery after walltime limits). Not used during CV
             unless you pass it on fold fits (not recommended).
         """
+        self._validate_backend()
         self.t_span = np.linspace(0.0, self.t_max, int(self.t_max / self.step))
         self.assignment_probabilities_ = None
         self._checkpoint_path = checkpoint_path
@@ -215,11 +241,30 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self._checkpoint_snapshot = None
 
         flat = self._prepare_data(X)
+        if self.backend == "jax":
+            from . import jax_core
+            from .optimizer_jax import nonfinite_events
+
+            packed, meta = jax_core.pack_data(
+                flat["X_obs"],
+                flat["obs_weight"],
+                flat["dt"],
+                flat["ids"],
+                flat["cog"],
+                flat["n_patients"],
+                pad_rows=self.jax_pad_rows,
+                pad_patients=self.jax_pad_patients,
+            )
+            flat["jax"] = dict(packed=(packed, meta), meta=meta)
+            self.jax_padded_shape_ = (meta["R"], meta["P"])
+            nonfinite_start = nonfinite_events()
         state = self._initialize_state(flat, X)
         self._register_checkpoint_signal_handler()
         try:
             self._run_em_loop(state, flat, X)
             self._finalize_fit(state, flat, X)
+            if self.backend == "jax":
+                self.jax_nonfinite_events_ = nonfinite_events() - nonfinite_start
             if self._checkpoint_path:
                 self._save_fit_checkpoint(state, flat, X, fit_complete=True)
         finally:
@@ -829,6 +874,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
     def _run_em_loop(self, state, flat, X):
         """Outer EM loop with checkpointing and θ-solver escalation."""
+        if self.backend == "jax":
+            state["solver_phases"] = ["jax"]
         if self.verbose >= 1:
             pbar = tqdm(total=self.max_iter)
         else:
@@ -920,6 +967,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
     def _em_step(self, state, flat, current_solver):
         """One EM iteration (global θ, E-step, cog regression, cluster f, beta)."""
+        if self.backend == "jax":
+            return self._em_step_jax(state, flat)
         X_obs = flat["X_obs"]
         dt = flat["dt"]
         ids = flat["ids"]
@@ -962,12 +1011,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         )
 
         loop_iter = state["loop_iter"]
-        use_jitter = (
-            self.assignments_jitter
-            and self.jitter_iter > 0
-            and (loop_iter % self.jitter_iter == 0)
-            and loop_iter > 0
-        )
+        use_jitter = self._use_jitter(loop_iter)
         if use_jitter:
             state["assignments"], probs = update_assignments_jitter(
                 X_obs,
@@ -1012,20 +1056,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 X_preds=globals_trajectories,
             )
 
-        for z in range(self.n_subtypes):
-            cl_idx = np.where(state["assignments"] == z)[0]
-            if len(cl_idx) == 0:
-                continue
-            cl_pids = unique_ids[cl_idx]
-            obs_mask = np.isin(ids, cl_pids)
-            cog_a, cog_b = fit_linear_cog_regression_multi(
-                cog[obs_mask],
-                dt[obs_mask],
-                state["current_beta"][cl_idx],
-                ids[obs_mask],
-            )
-            state["cluster_cog_a"][z] = cog_a
-            state["cluster_cog_b"][z] = cog_b
+        self._update_cog_regression(state, flat)
 
         for z in range(self.n_subtypes):
             cl_idx = np.where(state["assignments"] == z)[0]
@@ -1083,6 +1114,179 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             strict_tol=self.strict_tol,
             ode_method=self.ode_method,
             obs_weight=flat["obs_weight"],
+        )
+
+        return lse
+
+    def _use_jitter(self, loop_iter):
+        """Whether this outer iteration uses the jittered (sampled) E-step."""
+        return (
+            self.assignments_jitter
+            and self.jitter_iter > 0
+            and (loop_iter % self.jitter_iter == 0)
+            and loop_iter > 0
+        )
+
+    def _update_cog_regression(self, state, flat):
+        """Per-subtype cognitive regression on the current assignments and beta."""
+        dt = flat["dt"]
+        ids = flat["ids"]
+        cog = flat["cog"]
+        unique_ids = np.unique(ids)
+        for z in range(self.n_subtypes):
+            cl_idx = np.where(state["assignments"] == z)[0]
+            if len(cl_idx) == 0:
+                continue
+            cl_pids = unique_ids[cl_idx]
+            obs_mask = np.isin(ids, cl_pids)
+            cog_a, cog_b = fit_linear_cog_regression_multi(
+                cog[obs_mask],
+                dt[obs_mask],
+                state["current_beta"][cl_idx],
+                ids[obs_mask],
+            )
+            state["cluster_cog_a"][z] = cog_a
+            state["cluster_cog_b"][z] = cog_b
+
+    def _em_step_jax(self, state, flat):
+        """One EM iteration on the JAX backend (same step order as ``_em_step``)."""
+        from .optimizer_jax import (
+            estimate_beta_jax,
+            fit_theta_cluster_all_jax,
+            fit_theta_globals_jax,
+            solve_trajectories_jax,
+            update_assignments_hard_jax,
+            update_assignments_jitter_jax,
+        )
+
+        X_obs = flat["X_obs"]
+        dt = flat["dt"]
+        ids = flat["ids"]
+        cog = flat["cog"]
+        packed = flat["jax"]["packed"]
+
+        # globals_trajectories is solved at the converged globals with this same
+        # cluster_f, so the E-step below can reuse it. Ordering dependency: the
+        # joint fit_theta_cluster_all_jax call must stay AFTER the E-step, or this
+        # cache goes stale silently (wrong assignments, not a crash).
+        (
+            state["current_s"],
+            state["current_kappa"],
+            state["current_scalar_K"],
+            globals_trajectories,
+        ) = fit_theta_globals_jax(
+            X_obs=X_obs,
+            dt_obs=dt,
+            ids=ids,
+            K=self.K,
+            t_span=self.t_span,
+            beta_pred=state["current_beta"],
+            s_guess=state["current_s"],
+            kappa_guess=state["current_kappa"],
+            scalar_K_guess=state["current_scalar_K"],
+            lambda_s=0.0,
+            lambda_scalar=self.lambda_scalar,
+            lambda_kappa=self.lambda_kappa,
+            scalar_K_center=self.scalar_K_center,
+            fit_s=self.fit_s,
+            s_mask=self.s_mask_,
+            assignments=state["assignments"],
+            cluster_f=state["cluster_f"],
+            strict_tol=self.strict_tol,
+            obs_weight=flat["obs_weight"],
+            packed=packed,
+        )
+
+        loop_iter = state["loop_iter"]
+        estep_args = (
+            X_obs,
+            dt,
+            ids,
+            cog,
+            state["current_beta"],
+            state["cluster_f"],
+            state["current_scalar_K"],
+            state["current_kappa"],
+            state["current_s"],
+            self.K,
+            self.t_span,
+            state["cluster_cog_a"],
+            state["cluster_cog_b"],
+            self.lambda_cog,
+        )
+        if self._use_jitter(loop_iter):
+            state["assignments"], probs = update_assignments_jitter_jax(
+                *estep_args,
+                temperature=self.jitter_temperature,
+                rng=self.rng,
+                obs_weight=flat["obs_weight"],
+                X_preds=globals_trajectories,
+                packed=packed,
+            )
+            self.assignment_probabilities_ = probs
+        else:
+            state["assignments"] = update_assignments_hard_jax(
+                *estep_args,
+                obs_weight=flat["obs_weight"],
+                X_preds=globals_trajectories,
+                packed=packed,
+            )
+
+        self._update_cog_regression(state, flat)
+
+        if self.verbose >= 2:
+            for z in range(self.n_subtypes):
+                if not np.any(state["assignments"] == z):
+                    print(f"Warning: Cluster {z} is empty at iteration {loop_iter}")
+
+        state["cluster_f"] = fit_theta_cluster_all_jax(
+            X_obs,
+            dt,
+            ids,
+            self.K,
+            self.t_span,
+            cluster_f=state["cluster_f"],
+            assignments=state["assignments"],
+            s=state["current_s"],
+            scalar_K=state["current_scalar_K"],
+            lambda_f=self.lambda_f,
+            beta_pred=state["current_beta"],
+            kappa=state["current_kappa"],
+            strict_tol=self.strict_tol,
+            obs_weight=flat["obs_weight"],
+            packed=packed,
+        )
+
+        # Solve once at the new cluster_f; the beta step reuses these trajectories.
+        beta_trajectories = solve_trajectories_jax(
+            state["cluster_f"],
+            state["current_kappa"],
+            state["current_scalar_K"],
+            self.K,
+            self.t_span,
+        )
+
+        state["current_beta"], lse = estimate_beta_jax(
+            beta_all=state["current_beta"],
+            X_obs=X_obs,
+            dt=dt,
+            ids=ids,
+            cog=cog,
+            t_span=self.t_span,
+            trajectories=beta_trajectories,
+            s=state["current_s"],
+            assignments=state["assignments"],
+            cog_a=state["cluster_cog_a"],
+            cog_b=state["cluster_cog_b"],
+            lambda_cog=self.lambda_cog,
+            lambda_jsd=self.lambda_jsd,
+            lambda_beta=self.lambda_beta,
+            beta_mean=state["beta_mean"],
+            beta_var=state["beta_var"],
+            t_max=self.t_max,
+            strict_tol=self.strict_tol,
+            obs_weight=flat["obs_weight"],
+            packed=packed,
         )
 
         return lse

@@ -29,3 +29,4 @@ notebooks/ppmi_filter_2.ipynb
 experiment_pipeline/**/results/
 experiment_pipeline/**/logs/
 experiment_pipeline/pd_all/
+*.md
