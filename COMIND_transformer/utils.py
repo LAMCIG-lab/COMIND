@@ -136,6 +136,180 @@ def split_observed(X_obs):
     return X_filled, obs_weight
 
 
+def beta_upper_from_followup(dt_per_patient: Sequence, t_max: float) -> np.ndarray:
+    """
+    Per-patient β upper bound that keeps every visit inside ``[0, t_max]``.
+
+    Parameters
+    ----------
+    dt_per_patient : sequence of array-like
+        Time since first visit for each patient.
+    t_max : float
+        End of the model time grid.
+
+    Returns
+    -------
+    np.ndarray
+        ``cap_i = t_max - max(dt_i)``, shape (n_patients,).
+
+    Raises
+    ------
+    ValueError
+        If any ``cap_i <= 0``, i.e. ``t_max`` is shorter than that patient's
+        follow-up. The message lists the offending patient indices.
+    """
+    max_dt = np.array(
+        [float(np.max(np.asarray(d, dtype=float))) for d in dt_per_patient], dtype=float
+    )
+    cap = float(t_max) - max_dt
+    bad = np.flatnonzero(cap <= 0)
+    if bad.size:
+        raise ValueError(
+            f"cap_beta_by_followup: t_max={t_max} is shorter than the follow-up of "
+            f"patient index(es) {bad.tolist()} (max dt = {max_dt[bad].tolist()}), "
+            f"so their beta upper bound t_max - max(dt) is <= 0."
+        )
+    return cap
+
+
+def uniform_grid_bracket(t: np.ndarray, t_span: np.ndarray) -> np.ndarray:
+    """
+    Interval index ``j`` with ``t_span[j] <= t < t_span[j + 1]``, as ``np.interp`` finds it.
+
+    Parameters
+    ----------
+    t : np.ndarray
+        Query times, shape (N,).
+    t_span : np.ndarray
+        Increasing grid, shape (T,), T >= 2.
+
+    Returns
+    -------
+    np.ndarray
+        Integer indices in ``[0, T - 2]``, shape (N,). Times outside the grid
+        get the first or last interval; ``interp_uniform`` clamps them.
+
+    Notes
+    -----
+    On a uniform grid (``np.linspace``) the index is ``floor(t / h)`` followed
+    by a one-step correction against the actual ``t_span`` values, because
+    ``t_span[j]`` equals ``j * h`` only up to rounding. Non-uniform grids fall
+    back to ``np.searchsorted``.
+    """
+    t = np.asarray(t, dtype=float)
+    T = t_span.shape[0]
+    h = t_span[1] - t_span[0]
+    diffs = np.diff(t_span)
+    if not np.allclose(diffs, h, rtol=1e-9, atol=0.0):
+        return np.clip(np.searchsorted(t_span, t, side="right") - 1, 0, T - 2)
+    j = np.clip(np.floor((t - t_span[0]) / h), 0, T - 2).astype(np.intp)
+    down = (t < t_span[j]) & (j > 0)
+    j[down] -= 1
+    up = (t >= t_span[j + 1]) & (j < T - 2)
+    j[up] += 1
+    return j
+
+
+def interp_uniform(
+    fp: np.ndarray,
+    t: np.ndarray,
+    t_span: np.ndarray,
+    slopes: np.ndarray = None,
+) -> np.ndarray:
+    """
+    ``np.interp(t, t_span, fp[b])`` for every row ``b`` of ``fp`` at once.
+
+    Parameters
+    ----------
+    fp : np.ndarray
+        Values on the grid, shape (B, T).
+    t : np.ndarray
+        Query times, shape (N,).
+    t_span : np.ndarray
+        Grid, shape (T,).
+    slopes : np.ndarray, optional
+        Precomputed ``np.diff(fp, axis=1) / np.diff(t_span)``, shape (B, T - 1).
+
+    Returns
+    -------
+    np.ndarray
+        Interpolated values, shape (B, N).
+
+    Notes
+    -----
+    Uses ``np.interp``'s own formula ``slope_j * (t - t_span[j]) + fp[j]``,
+    its exact-hit branch (``t == t_span[j]`` returns ``fp[j]``) and its end
+    clamping, so results match ``np.interp`` to rounding (in practice
+    bit-for-bit).
+    """
+    t = np.asarray(t, dtype=float)
+    j = uniform_grid_bracket(t, t_span)
+    if slopes is None:
+        slopes = np.diff(fp, axis=1) / np.diff(t_span)
+    x0 = t_span[j]
+    out = slopes[:, j] * (t - x0) + fp[:, j]
+    exact = t == x0
+    if exact.any():
+        out[:, exact] = fp[:, j[exact]]
+    left = t < t_span[0]
+    if left.any():
+        out[:, left] = fp[:, :1]
+    right = t >= t_span[-1]
+    if right.any():
+        out[:, right] = fp[:, -1:]
+    return out
+
+
+def make_beta_grid(
+    t_max: float, n: int, lo_frac: float = 0.1, hi_frac: float = 0.9
+) -> np.ndarray:
+    """
+    β grid shared by ``transform``, ``transform_soft`` and the joint-grid E-step.
+
+    Parameters
+    ----------
+    t_max : float
+        End of the model time grid.
+    n : int
+        Number of grid points.
+    lo_frac, hi_frac : float
+        Grid range as fractions of ``t_max``.
+
+    Returns
+    -------
+    np.ndarray
+        ``np.linspace(lo_frac * t_max, hi_frac * t_max, n)``.
+    """
+    return np.linspace(lo_frac * t_max, hi_frac * t_max, n)
+
+
+def check_beta_grid_within_cap(beta_grid: np.ndarray, beta_upper: np.ndarray) -> None:
+    """
+    Raise if some patient's cap excludes every β grid point.
+
+    Parameters
+    ----------
+    beta_grid : np.ndarray
+        Candidate βs, shape (G,).
+    beta_upper : np.ndarray
+        Per-patient upper bound, shape (n_patients,).
+
+    Raises
+    ------
+    ValueError
+        Lists the patient indices whose ``beta_upper`` is below every grid
+        point, i.e. ``t_max`` is too short for their follow-up.
+    """
+    bad = np.flatnonzero(np.asarray(beta_upper) < np.min(beta_grid))
+    if bad.size:
+        raise ValueError(
+            f"cap_beta_by_followup: every beta grid point exceeds the cap "
+            f"t_max - max(dt) of patient index(es) {bad.tolist()} "
+            f"(smallest grid point {float(np.min(beta_grid)):.6g}); t_max is "
+            f"too short for their follow-up."
+        )
+
+
 def initialize_beta(ids: np.ndarray, beta_range: tuple = (0, 12), rng: np.random.Generator = None) -> np.ndarray:
     """
     Uniformly randomly initialize beta values for each unique patient ID.

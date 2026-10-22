@@ -36,6 +36,7 @@ from .assignments import (
     precompute_trajectories,
     sse_matrix,
     update_assignments_hard,
+    update_assignments_joint_grid,
     update_assignments_jitter,
 )
 from .model_selection import (
@@ -48,6 +49,9 @@ from .optimizer_theta_cluster import fit_theta_cluster
 from .optimizer_beta import estimate_beta, reconstruction_sse
 from .optimizer_cognitive_regression import fit_linear_cog_regression_multi
 from .utils import (
+    beta_upper_from_followup,
+    check_beta_grid_within_cap,
+    make_beta_grid,
     solve_system,
     initialize_beta,
     ensure_2d_cog,
@@ -57,6 +61,8 @@ from .utils import (
 
 
 _BACKENDS = {"numpy", "jax"}
+_ESTEP_MODES = {"current", "joint_grid"}
+_AT_UPPER_TOL = 1e-3
 
 
 def _lse_improvement_acceptable(best, lse_val, eps, rel_tol):
@@ -110,16 +116,50 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     ``s_mask`` (optional boolean vector): True = optimize that biomarker's
     scale ``s``; False = hold it at 1. Use this for ceiling-normalized
     clinical scores whose scale is already known. ``fit_s=False`` fixes
-    every entry regardless of ``s_mask``.
+    every entry regardless of ``s_mask``. ``s_lower_percentile`` (e.g. 95)
+    bounds each free ``s`` (the biomarker's asymptote) from below by that
+    percentile of the biomarker's observed training values (floored at 0);
+    initial ``s`` is raised to the bound. ``None`` (default) keeps the lower
+    bound at 0. The bound is stored as ``s_lower_`` after ``fit``.
 
     ``backend="jax"`` replaces the globals, E-step, cluster-f and beta steps
     with JAX versions (RK4 forward solve on ``t_span``, exact reverse-mode
     gradients, scipy L-BFGS-B). ``theta_solver_stages`` is ignored: each
-    outer iteration runs exactly one stage. Cognitive regression, BIC,
-    checkpointing, ``transform`` and ``transform_soft`` stay NumPy/LSODA, so
-    the final BIC is an LSODA consistency check on the JAX-fitted parameters.
+    outer iteration runs exactly one stage. Cognitive regression, BIC and
+    checkpointing stay NumPy/LSODA, so the final BIC is an LSODA consistency
+    check on the JAX-fitted parameters. ``transform`` and ``transform_soft``
+    also stay NumPy/LSODA unless ``transform_backend="jax"``.
     Pass the same ``jax_pad_rows`` / ``jax_pad_patients`` to every CV fold so
     all folds share one compiled function. Requires ``pip install "jax[cpu]"``.
+
+    ``cap_beta_by_followup=True`` bounds patient i's beta to
+    ``[0, t_max - max(dt_i)]`` in the beta step and in ``transform`` /
+    ``transform_soft``, so every visit stays inside ``t_span`` instead of
+    reading the clamped end value of the trajectory. Initial betas are clipped
+    to that range. The bounds are stored as ``beta_upper_`` after ``fit``.
+
+    ``estep_mode="joint_grid"`` replaces the hard E-step with a joint search
+    over (beta, subtype): each patient's candidates are their current beta and
+    the ``estep_grid_size``-point grid ``make_beta_grid(t_max, n)`` (default
+    ``n_beta_grid`` points), and the beta step then warm-starts from the
+    chosen beta. On iterations where the jittered E-step runs
+    (``assignments_jitter``), it runs exactly as before and ``estep_mode`` is
+    ignored for that iteration. See
+    ``assignments.update_assignments_joint_grid`` for the guarantees.
+
+    ``transform_backend="jax"`` runs ``transform`` / ``transform_soft`` on
+    JAX (RK4 trajectories, ``joint_grid_select``, one joint L-BFGS-B
+    refinement per call). It is independent of ``backend``: the default
+    ``None`` keeps the NumPy/LSODA transform for both backends, so held-out
+    scores of past fits are unchanged. Pass the same
+    ``transform_pad_rows`` / ``transform_pad_patients`` to every CV fold to
+    share one compiled shape.
+
+    Diagnostics recorded every iteration (index 0 = initial state):
+    ``subtype_counts_history_`` (n_subtypes, n_iter + 1),
+    ``beta_at_upper_fraction_history_`` (fraction of patients with
+    ``beta_i >= beta_upper_i - 1e-3``) and ``estep_beta_moves_history_``
+    (patients whose beta the E-step moved; always 0 in ``"current"`` mode).
     """
 
     def __init__(
@@ -164,6 +204,19 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         backend: str = "numpy",
         jax_pad_rows: int = None,
         jax_pad_patients: int = None,
+        cap_beta_by_followup: bool = False,
+        estep_mode: str = "current",
+        estep_grid_size: int = None,
+        transform_backend: str = None,
+        transform_pad_rows: int = None,
+        transform_pad_patients: int = None,
+        s_lower_percentile: float = None,
+        fit_intercept: bool = False,
+        initial_c: np.ndarray = None,
+        c_bounds=None,
+        c_mask: np.ndarray = None,
+        lambda_c: float = 0.0,
+        c_center: np.ndarray = None,
     ):
         self.max_iter = max_iter
         self.t_max = t_max
@@ -214,6 +267,20 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.backend = backend
         self.jax_pad_rows = jax_pad_rows
         self.jax_pad_patients = jax_pad_patients
+        self.cap_beta_by_followup = cap_beta_by_followup
+        self.estep_mode = estep_mode
+        self.estep_grid_size = estep_grid_size
+        self.transform_backend = transform_backend
+        self.transform_pad_rows = transform_pad_rows
+        self.transform_pad_patients = transform_pad_patients
+        self.s_lower_percentile = s_lower_percentile
+        # Per-biomarker intercept: prediction = c + s * x (JAX backend only).
+        self.fit_intercept = fit_intercept
+        self.initial_c = initial_c
+        self.c_bounds = c_bounds
+        self.c_mask = c_mask
+        self.lambda_c = lambda_c
+        self.c_center = c_center
         self._validate_backend()
 
     def _validate_backend(self):
@@ -221,6 +288,54 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             raise ValueError(
                 f"backend must be one of {sorted(_BACKENDS)}, got {self.backend!r}"
             )
+        if getattr(self, "fit_intercept", False) and self.backend != "jax":
+            raise ValueError("fit_intercept=True requires backend='jax'")
+        if self.estep_mode not in _ESTEP_MODES:
+            raise ValueError(
+                f"estep_mode must be one of {sorted(_ESTEP_MODES)}, got {self.estep_mode!r}"
+            )
+        if self.transform_backend not in (None, "numpy", "jax"):
+            raise ValueError(
+                f"transform_backend must be None, 'numpy' or 'jax', "
+                f"got {self.transform_backend!r}"
+            )
+        if self.estep_grid_size is not None and int(self.estep_grid_size) < 1:
+            raise ValueError(
+                f"estep_grid_size must be >= 1 or None, got {self.estep_grid_size!r}"
+            )
+
+    def _resolve_c_bounds(self, n_biomarkers: int) -> np.ndarray:
+        """(B, 2) intercept bounds. ``c_mask`` False entries are fixed at their initial c."""
+        if self.c_bounds is None:
+            b = np.tile([-np.inf, np.inf], (n_biomarkers, 1))
+        else:
+            b = np.asarray(self.c_bounds, dtype=float)
+            b = np.tile(b.reshape(1, 2), (n_biomarkers, 1)) if b.size == 2 else b.reshape(n_biomarkers, 2).copy()
+        return b
+
+    def _initial_c(self, n_biomarkers: int) -> np.ndarray:
+        if self.initial_c is None:
+            return np.zeros(n_biomarkers)
+        c = np.asarray(self.initial_c, dtype=float).ravel().copy()
+        if c.shape != (n_biomarkers,):
+            raise ValueError(f"initial_c must have shape ({n_biomarkers},), got {c.shape}")
+        return c
+
+    def _final_c_or_zero(self, n_biomarkers: int) -> np.ndarray:
+        c = getattr(self, "final_c", None)
+        return np.zeros(n_biomarkers) if c is None else np.asarray(c, dtype=float)
+
+    def _shift_patients(self, X: list) -> list:
+        """Copies of the patient dicts with ``X_obs - final_c`` (no-op without an intercept)."""
+        if not self.fit_intercept or getattr(self, "final_c", None) is None:
+            return X
+        c = np.asarray(self.final_c, dtype=float)
+        return [{**p, "X_obs": np.asarray(p["X_obs"], dtype=float) - c[None, :]} for p in X]
+
+    def _estep_beta_grid(self) -> np.ndarray:
+        """beta grid for the joint-grid E-step (``n_beta_grid`` points by default)."""
+        n = self.n_beta_grid if self.estep_grid_size is None else int(self.estep_grid_size)
+        return make_beta_grid(self.t_max, n)
 
     def fit(self, X: list, y=None, checkpoint_path=None):
         """
@@ -255,7 +370,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 pad_rows=self.jax_pad_rows,
                 pad_patients=self.jax_pad_patients,
             )
-            flat["jax"] = dict(packed=(packed, meta), meta=meta)
+            flat["jax"] = dict(packed=(packed, meta), packed_raw=(packed, meta), meta=meta)
             self.jax_padded_shape_ = (meta["R"], meta["P"])
             nonfinite_start = nonfinite_events()
         state = self._initialize_state(flat, X)
@@ -271,20 +386,15 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self._unregister_checkpoint_signal_handler()
         return self
 
-    def transform(self, X: list, use_cognitive_prior: bool = True) -> np.ndarray:
-        """
-        Estimate beta (time-shift) and subtype assignment for each patient.
+    def _transform_backend_resolved(self) -> str:
+        """``"jax"`` only when ``transform_backend="jax"``; otherwise NumPy/LSODA."""
+        tb = getattr(self, "transform_backend", None)
+        return "jax" if tb == "jax" else "numpy"
 
-        Returns a structured array with dtype [('beta', 'f8'), ('subtype', 'i4')].
-        """
-        if not hasattr(self, "cluster_f") or not hasattr(self, "cluster_cog_a"):
-            raise RuntimeError("fit() must be called before transform()")
-
-        n_biomarkers = X[0]["X_obs"].shape[1]
-        lam_cog = self.lambda_cog if use_cognitive_prior else 0.0
-        results = np.zeros(len(X), dtype=[("beta", "f8"), ("subtype", "i4")])
-
-        X_preds = [
+    def _transform_trajectories_numpy(self) -> list:
+        """Per-subtype (B, T) LSODA trajectories at the fitted parameters."""
+        n_biomarkers = np.ravel(self.cluster_f[0]).shape[0]
+        return [
             solve_system(
                 np.zeros(n_biomarkers),
                 np.ravel(self.cluster_f[z]),
@@ -296,7 +406,37 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             )
             for z in range(self.n_subtypes)
         ]
-        beta_grid = np.linspace(0.1 * self.t_max, 0.9 * self.t_max, self.n_beta_grid)
+
+    def transform(self, X: list, use_cognitive_prior: bool = True, _shifted: bool = False) -> np.ndarray:
+        """
+        Estimate beta (time-shift) and subtype assignment for each patient.
+
+        Uses the JAX implementation (``_transform_jax``) when
+        ``transform_backend="jax"`` and the NumPy/LSODA one otherwise.
+
+        Returns a structured array with dtype [('beta', 'f8'), ('subtype', 'i4')].
+        """
+        if not hasattr(self, "cluster_f") or not hasattr(self, "cluster_cog_a"):
+            raise RuntimeError("fit() must be called before transform()")
+        if not _shifted:
+            X = self._shift_patients(X)
+        if self._transform_backend_resolved() == "jax":
+            return self._transform_jax(X, use_cognitive_prior)
+        return self._transform_numpy(X, use_cognitive_prior)
+
+    def _transform_numpy(
+        self, X: list, use_cognitive_prior: bool = True, *, _trajectories=None
+    ) -> np.ndarray:
+        """NumPy ``transform``. ``_trajectories`` (list of (B, T)) replaces the LSODA solve."""
+        lam_cog = self.lambda_cog if use_cognitive_prior else 0.0
+        results = np.zeros(len(X), dtype=[("beta", "f8"), ("subtype", "i4")])
+
+        X_preds = (
+            self._transform_trajectories_numpy() if _trajectories is None
+            else [np.asarray(x, dtype=float) for x in _trajectories]
+        )
+        beta_grid = make_beta_grid(self.t_max, self.n_beta_grid)
+        caps = self._transform_beta_caps(X, beta_grid)
 
         for idx, p in enumerate(tqdm(X, desc="Estimating beta and subtype assignments")):
             X_obs_i, obs_weight_i = split_observed(p["X_obs"])
@@ -317,6 +457,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                         sse_grid[gi, z] += lam_cog * np.sum(
                             (dt_i + beta_g - cog_pred_z) ** 2
                         )
+            if caps is not None:
+                sse_grid[beta_grid > caps[idx], :] = np.inf
 
             best_gi, best_z = np.unravel_index(np.argmin(sse_grid), sse_grid.shape)
 
@@ -342,6 +484,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 t_max=self.t_max,
                 kappa=self.final_kappa,
                 obs_weight=obs_weight_i,
+                beta_upper=None if caps is None else caps[idx:idx + 1],
+                X_preds=None if _trajectories is None else X_preds,
             )
             results[idx]["beta"] = float(beta_vec[0])
             results[idx]["subtype"] = best_z
@@ -381,33 +525,34 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
           beta_1 .. beta_K, proba_1 .. proba_K
         (1-indexed subtype columns). With ``per_timepoint=True`` also:
           patient_idx, visit, t_obs, id.
+
+        Uses the JAX implementation (``_transform_soft_jax``) when
+        ``transform_backend="jax"`` and the NumPy/LSODA one otherwise.
         """
         if not hasattr(self, "cluster_f") or not hasattr(self, "cluster_cog_a"):
             raise RuntimeError("fit() must be called before transform_soft()")
         if temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {temperature}")
+        X = self._shift_patients(X)
+        impl = (
+            self._transform_soft_jax
+            if self._transform_backend_resolved() == "jax"
+            else self._transform_soft_numpy
+        )
+        return impl(X, use_cognitive_prior, temperature, per_timepoint)
 
-        n_patients = len(X)
-        n_biomarkers = X[0]["X_obs"].shape[1]
+    def _soft_cog_lists(self):
+        """Per-subtype cognitive slopes and intercepts as lists."""
         n_subtypes = self.n_subtypes
-        lam_cog = self.lambda_cog if use_cognitive_prior else 0.0
-
-        # estimate_beta expects list-of-per-subtype arrays (not a stacked ndarray).
-        cluster_f = [
-            np.ravel(self.cluster_f[z]) for z in range(n_subtypes)
-        ]
         if isinstance(self.cluster_cog_a, list):
-            cluster_cog_a = self.cluster_cog_a
-            cluster_cog_b = self.cluster_cog_b
-        else:
-            cluster_cog_a = [
-                np.asarray(self.cluster_cog_a[z], dtype=float)
-                for z in range(n_subtypes)
-            ]
-            cluster_cog_b = [
-                float(self.cluster_cog_b[z]) for z in range(n_subtypes)
-            ]
+            return self.cluster_cog_a, self.cluster_cog_b
+        return (
+            [np.asarray(self.cluster_cog_a[z], dtype=float) for z in range(n_subtypes)],
+            [float(self.cluster_cog_b[z]) for z in range(n_subtypes)],
+        )
 
+    def _soft_results(self, X: list, per_timepoint: bool) -> np.ndarray:
+        """Empty structured output array for ``transform_soft``."""
         dtype = [
             ("beta", "f8"),
             ("subtype", "i4"),
@@ -420,53 +565,76 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 ("t_obs", "f8"),
                 ("id", "O"),
             ])
-        for z in range(n_subtypes):
+        for z in range(self.n_subtypes):
             dtype.append((f"beta_{z + 1}", "f8"))
-        for z in range(n_subtypes):
+        for z in range(self.n_subtypes):
             dtype.append((f"proba_{z + 1}", "f8"))
-
         n_rows = (
             sum(np.asarray(p["dt"]).reshape(-1).size for p in X)
-            if per_timepoint else n_patients
+            if per_timepoint else len(X)
         )
-        results = np.zeros(n_rows, dtype=dtype)
+        return np.zeros(n_rows, dtype=dtype)
+
+    @staticmethod
+    def _softmax_from_lse(lse, temperature):
+        log_p = -np.asarray(lse, dtype=float) / temperature
+        log_p -= np.max(log_p)
+        proba = np.exp(log_p)
+        proba /= proba.sum()
+        return proba
+
+    @staticmethod
+    def _write_soft_row(results, row, beta, subtype, subtype_best, beta_by_z, proba,
+                        patient_idx=None, visit=None, t_obs=None, pid=None):
+        results[row]["beta"] = float(beta)
+        results[row]["subtype"] = int(subtype)
+        results[row]["subtype_best"] = int(subtype_best)
+        for z in range(len(beta_by_z)):
+            results[row][f"beta_{z + 1}"] = float(beta_by_z[z])
+            results[row][f"proba_{z + 1}"] = float(proba[z])
+        if patient_idx is not None:
+            results[row]["patient_idx"] = int(patient_idx)
+            results[row]["visit"] = int(visit)
+            results[row]["t_obs"] = float(t_obs)
+            results[row]["id"] = pid
+
+    def _transform_soft_numpy(
+        self,
+        X: list,
+        use_cognitive_prior: bool = True,
+        temperature: float = 1.0,
+        per_timepoint: bool = False,
+        *,
+        _trajectories=None,
+    ) -> np.ndarray:
+        """NumPy ``transform_soft``. ``_trajectories`` (list of (B, T)) replaces the LSODA solve."""
+        n_patients = len(X)
+        n_subtypes = self.n_subtypes
+        lam_cog = self.lambda_cog if use_cognitive_prior else 0.0
+
+        # estimate_beta expects list-of-per-subtype arrays (not a stacked ndarray).
+        cluster_f = [
+            np.ravel(self.cluster_f[z]) for z in range(n_subtypes)
+        ]
+        cluster_cog_a, cluster_cog_b = self._soft_cog_lists()
+
+        results = self._soft_results(X, per_timepoint)
         beta_val = np.zeros(n_patients, dtype=float)
         transform_assignments = np.zeros(n_patients, dtype=np.int32)
 
-        X_preds = [
-            solve_system(
-                np.zeros(n_biomarkers),
-                cluster_f[z],
-                self.K,
-                self.t_span,
-                self.final_scalar_K,
-                self.final_kappa,
-                ode_method=self.ode_method,
-            )
-            for z in range(n_subtypes)
-        ]
-        beta_grid = np.linspace(0.1 * self.t_max, 0.9 * self.t_max, self.n_beta_grid)
+        X_preds = (
+            self._transform_trajectories_numpy() if _trajectories is None
+            else [np.asarray(x, dtype=float) for x in _trajectories]
+        )
+        given_preds = None if _trajectories is None else X_preds
+        beta_grid = make_beta_grid(self.t_max, self.n_beta_grid)
+        caps = self._transform_beta_caps(X, beta_grid)
 
         def _softmax_from_lse(lse):
-            log_p = -np.asarray(lse, dtype=float) / temperature
-            log_p -= np.max(log_p)
-            proba = np.exp(log_p)
-            proba /= proba.sum()
-            return proba
+            return self._softmax_from_lse(lse, temperature)
 
-        def _write_row(row, beta, subtype, subtype_best, beta_by_z, proba,
-                       patient_idx=None, visit=None, t_obs=None, pid=None):
-            results[row]["beta"] = float(beta)
-            results[row]["subtype"] = int(subtype)
-            results[row]["subtype_best"] = int(subtype_best)
-            for z in range(n_subtypes):
-                results[row][f"beta_{z + 1}"] = float(beta_by_z[z])
-                results[row][f"proba_{z + 1}"] = float(proba[z])
-            if per_timepoint:
-                results[row]["patient_idx"] = int(patient_idx)
-                results[row]["visit"] = int(visit)
-                results[row]["t_obs"] = float(t_obs)
-                results[row]["id"] = pid
+        def _write_row(row, *args, **kwargs):
+            self._write_soft_row(results, row, *args, **kwargs)
 
         row = 0
         for idx, p in enumerate(
@@ -490,6 +658,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                         sse_grid[gi, z] += lam_cog * np.sum(
                             (dt_i + beta_g - cog_pred_z) ** 2
                         )
+            if caps is not None:
+                sse_grid[beta_grid > caps[idx], :] = np.inf
+            upper_i = None if caps is None else caps[idx:idx + 1]
 
             beta_by_z = np.zeros(n_subtypes, dtype=float)
             lse_by_z = np.zeros(n_subtypes, dtype=float)
@@ -518,6 +689,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     kappa=self.final_kappa,
                     ode_method=self.ode_method,
                     obs_weight=obs_weight_i,
+                    beta_upper=upper_i,
+                    X_preds=given_preds,
                 )
                 beta_by_z[z] = float(beta_vec[0])
                 lse_by_z[z] = float(lse_z)
@@ -547,6 +720,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 kappa=self.final_kappa,
                 ode_method=self.ode_method,
                 obs_weight=obs_weight_i,
+                beta_upper=upper_i,
+                X_preds=given_preds,
             )
             beta_joint = float(beta_vec[0])
             best_z = int(best_z)
@@ -606,13 +781,221 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         )
         return results
 
+    def _transform_jax_setup(self, X: list, use_cognitive_prior: bool, _trajectories):
+        """Stack and pack new patients, solve trajectories, and build the beta grid."""
+        from . import jax_core as jc
+        from .optimizer_jax import _stack_cog, solve_trajectories_jax, trajectories_to_jax
+
+        n_patients = len(X)
+        dts = [np.asarray(p["dt"], dtype=float).reshape(-1) for p in X]
+        X_raw = np.vstack([np.asarray(p["X_obs"], dtype=float) for p in X])
+        dt = np.concatenate(dts)
+        ids = np.concatenate([np.full(len(d), i) for i, d in enumerate(dts)])
+        cog = np.vstack([ensure_2d_cog(p["cog"], len(d)) for p, d in zip(X, dts)])
+        X_obs, obs_weight = split_observed(X_raw)
+        data, meta = jc.pack_data(
+            X_raw, None, dt, ids, cog, n_patients,
+            pad_rows=getattr(self, "transform_pad_rows", None),
+            pad_patients=getattr(self, "transform_pad_patients", None),
+        )
+        if _trajectories is None:
+            traj = solve_trajectories_jax(
+                self.cluster_f, self.final_kappa, self.final_scalar_K, self.K, self.t_span
+            )
+        else:
+            traj = trajectories_to_jax(_trajectories)
+        cog_a, cog_b = self._soft_cog_lists()
+        A, b = _stack_cog(cog_a, cog_b, self.n_subtypes, data.cog.shape[1])
+        beta_grid = make_beta_grid(self.t_max, self.n_beta_grid)
+        _, h, _ = jc.grid_from_t_span(self.t_span)
+        return dict(
+            n_patients=n_patients, n_rows=len(dt), dts=dts,
+            X_obs=X_obs, obs_weight=obs_weight, dt=dt, ids=ids, cog=cog,
+            packed=(data, meta), traj=traj, cog_a=cog_a, cog_b=cog_b,
+            A=jc.f64(A), b=jc.f64(b), s=jc.f64(np.ravel(self.final_s)), h=jc.f64(h),
+            lam_cog=self.lambda_cog if use_cognitive_prior else 0.0,
+            beta_grid=beta_grid, caps=self._transform_beta_caps(X, beta_grid),
+        )
+
+    def _transform_jax_select(self, st: dict):
+        """Joint (grid beta, subtype) selection with ``joint_grid_select`` (grid only)."""
+        from . import jax_core as jc
+        from .optimizer_jax import _grid_candidates, _pad_upper
+
+        data, meta = st["packed"]
+        n, P = st["n_patients"], meta["P"]
+        best_beta, best_z = jc._joint_grid_select_jit(
+            st["traj"], st["s"], _grid_candidates(st["beta_grid"], P), data,
+            st["A"], st["b"], jc.f64(st["lam_cog"]),
+            _pad_upper(st["caps"], n, P, self.t_max), st["h"],
+        )
+        return (
+            np.asarray(best_beta, dtype=np.float64)[:n].copy(),
+            np.asarray(best_z)[:n].astype(np.int32),
+        )
+
+    def _transform_jax_refine(self, st: dict, beta0: np.ndarray, assignments: np.ndarray):
+        """One joint L-BFGS-B refinement of every new patient's beta, subtypes fixed."""
+        from .optimizer_jax import estimate_beta_jax
+
+        beta, _ = estimate_beta_jax(
+            beta_all=beta0,
+            X_obs=st["X_obs"],
+            dt=st["dt"],
+            ids=st["ids"],
+            cog=st["cog"],
+            t_span=self.t_span,
+            trajectories=st["traj"],
+            s=self.final_s,
+            assignments=assignments,
+            cog_a=st["cog_a"],
+            cog_b=st["cog_b"],
+            lambda_cog=st["lam_cog"],
+            lambda_jsd=0.0,
+            lambda_beta=0.0,
+            beta_mean=None,
+            beta_var=None,
+            t_max=self.t_max,
+            strict_tol=True,
+            obs_weight=st["obs_weight"],
+            beta_upper=st["caps"],
+            packed=st["packed"],
+            maxiter=500,
+        )
+        return beta
+
+    def _transform_jax(
+        self, X: list, use_cognitive_prior: bool = True, *, _trajectories=None
+    ) -> np.ndarray:
+        """
+        JAX ``transform``: joint grid selection, then one joint beta refinement.
+
+        Subtype and starting beta come from ``jax_core.joint_grid_select`` over
+        ``make_beta_grid(t_max, n_beta_grid)`` (candidates above a patient's
+        cap are skipped when ``cap_beta_by_followup``). Every patient's beta is
+        then refined in a single L-BFGS-B call with subtypes fixed,
+        ``lambda_jsd = lambda_beta = 0``, bounds ``(0, cap_i)`` (or
+        ``(0, t_max)``), strict tolerances and ``maxiter = 500``. That loss is
+        a sum of independent per-patient terms, so the joint call is
+        equivalent to per-patient refinement up to the stopping tolerance; it
+        replaces n separate scipy calls with one.
+
+        ``_trajectories`` (list of (B, T) or a (Z, T, B) array) replaces the
+        RK4 solve, so tests can compare backends on identical trajectories.
+        """
+        st = self._transform_jax_setup(X, use_cognitive_prior, _trajectories)
+        beta0, best_z = self._transform_jax_select(st)
+        beta = self._transform_jax_refine(st, beta0, best_z)
+
+        results = np.zeros(len(X), dtype=[("beta", "f8"), ("subtype", "i4")])
+        results["beta"] = beta
+        results["subtype"] = best_z
+        self.beta_val = results["beta"]
+        self.transform_assignments = results["subtype"]
+        return results
+
+    def _transform_soft_jax(
+        self,
+        X: list,
+        use_cognitive_prior: bool = True,
+        temperature: float = 1.0,
+        per_timepoint: bool = False,
+        *,
+        _trajectories=None,
+    ) -> np.ndarray:
+        """
+        JAX ``transform_soft`` with Z + 1 joint refinements instead of n * (Z + 1).
+
+        For each subtype z, every patient is assigned to z and refined jointly
+        (as in ``_transform_jax``) from that subtype's best grid point; the
+        per-patient reconstruction LSE at the refined betas is column z of
+        ``sse_matrix_jax`` (no cognitive term, as ``estimate_beta``'s returned
+        LSE in the NumPy version). ``beta`` / ``subtype`` come from the same
+        joint selection and refinement as ``_transform_jax``. Output fields,
+        probabilities, ``subtype_best`` and the ``per_timepoint`` expansion
+        match ``_transform_soft_numpy``; per-visit probabilities use
+        ``sse_rows_jax`` at the joint beta.
+        """
+        from . import jax_core as jc
+        from .optimizer_jax import _grid_candidates
+
+        st = self._transform_jax_setup(X, use_cognitive_prior, _trajectories)
+        data, meta = st["packed"]
+        n, P, Z = st["n_patients"], meta["P"], self.n_subtypes
+        beta_grid = st["beta_grid"]
+
+        losses = np.array(jc._joint_grid_losses_jit(
+            st["traj"], st["s"], _grid_candidates(beta_grid, P), data,
+            st["A"], st["b"], jc.f64(st["lam_cog"]), st["h"],
+        ), dtype=np.float64)[:, :n, :]
+        if st["caps"] is not None:
+            losses[beta_grid[:, None] > st["caps"][None, :], :] = np.inf
+        best_gi = np.argmin(losses, axis=0)  # (n, Z)
+
+        beta_by_z = np.zeros((n, Z))
+        lse_by_z = np.zeros((n, Z))
+        for z in range(Z):
+            beta_z = self._transform_jax_refine(
+                st, beta_grid[best_gi[:, z]], np.full(n, z, dtype=np.int32)
+            )
+            beta_by_z[:, z] = beta_z
+            lse = jc._sse_matrix_jit(
+                st["traj"], st["s"], jc.pad_beta(beta_z, P), data,
+                st["A"], st["b"], jc.f64(0.0), st["h"],
+            )
+            lse_by_z[:, z] = np.asarray(lse, dtype=np.float64)[:n, z]
+
+        beta0, best_z = self._transform_jax_select(st)
+        beta_joint = self._transform_jax_refine(st, beta0, best_z)
+
+        results = self._soft_results(X, per_timepoint)
+        if per_timepoint:
+            row_sse = np.asarray(jc._sse_rows_jit(
+                st["traj"], st["s"], jc.pad_beta(beta_joint, P), data,
+                st["A"], st["b"], jc.f64(st["lam_cog"]), st["h"],
+            ), dtype=np.float64)[: st["n_rows"]]
+            row = 0
+            for idx, (p, dt_i) in enumerate(zip(X, st["dts"])):
+                pid = p.get("id", idx)
+                for t in range(len(dt_i)):
+                    proba = self._softmax_from_lse(row_sse[row], temperature)
+                    self._write_soft_row(
+                        results, row, beta_joint[idx], best_z[idx], int(np.argmax(proba)),
+                        beta_by_z[idx], proba, patient_idx=idx, visit=t,
+                        t_obs=dt_i[t] + beta_joint[idx], pid=pid,
+                    )
+                    row += 1
+        else:
+            for idx in range(n):
+                proba = self._softmax_from_lse(lse_by_z[idx], temperature)
+                self._write_soft_row(
+                    results, idx, beta_joint[idx], best_z[idx], int(np.argmax(proba)),
+                    beta_by_z[idx], proba,
+                )
+
+        self.beta_val = beta_joint
+        self.transform_assignments = best_z.astype(np.int32)
+        self.assignment_probabilities_ = np.column_stack(
+            [results[f"proba_{z + 1}"] for z in range(Z)]
+        )
+        return results
+
+    def _transform_beta_caps(self, X: list, beta_grid: np.ndarray):
+        """Per-patient beta caps for ``transform``, or None when the cap is off."""
+        if not getattr(self, "cap_beta_by_followup", False):
+            return None
+        caps = beta_upper_from_followup([p["dt"] for p in X], self.t_max)
+        check_beta_grid_within_cap(beta_grid, caps)
+        return caps
+
     def score(self, X: list, y=None) -> float:
         """Negative per-subtype reconstruction LSE on X (higher = better, for sklearn CV).
 
         Each patient is scored on the trajectory of the subtype ``transform`` assigns,
         not on a single shared curve.
         """
-        transformed = self.transform(X)
+        X = self._shift_patients(X)
+        transformed = self.transform(X, _shifted=True)
         return -self._compute_val_score(
             X, transformed["beta"], transformed["subtype"]
         )
@@ -669,6 +1052,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         var_per_biomarker_null = np.maximum(
             np.nanvar(X_obs_raw, axis=0, ddof=1), 1e-12
         )
+        s_lower = None
+        if self.s_lower_percentile is not None:
+            s_lower = np.maximum(
+                np.nanpercentile(X_obs_raw, float(self.s_lower_percentile), axis=0), 0.0
+            )
         X_obs, obs_weight = split_observed(X_obs_raw)
         n_obs = int(obs_weight.sum())
 
@@ -702,6 +1090,21 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         max_val = np.max(beta)
         beta[(beta > max_val - 1) & (beta < max_val)] -= 2
 
+        if self.cap_beta_by_followup:
+            beta_upper = beta_upper_from_followup(dt_list, self.t_max)
+            clipped = (beta < 0) | (beta > beta_upper)
+            n_clipped = int(np.sum(clipped))
+            if n_clipped > 0:
+                warnings.warn(
+                    f"cap_beta_by_followup: clipped the initial beta of {n_clipped} "
+                    f"patient(s) to [0, t_max - max(dt_i)].",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                beta = np.clip(beta, 0.0, beta_upper)
+        else:
+            beta_upper = np.full(n_patients, float(self.t_max))
+
         beta_mean = np.mean(beta)
         beta_var = max(np.var(beta), 1e-8)
 
@@ -713,6 +1116,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             n_patients=n_patients,
             n_biomarkers=n_biomarkers,
             initial_beta=beta,
+            beta_upper=beta_upper,
+            s_lower=s_lower,
             beta_mean=beta_mean,
             beta_var=beta_var,
             n_obs=n_obs,
@@ -735,8 +1140,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             s = rng.uniform(0.1, 3, size=n_biomarkers)
 
         s_mask_bool = resolve_s_mask(n_biomarkers, self.fit_s, self.s_mask)
+        if flat["s_lower"] is not None:
+            s = np.maximum(s, flat["s_lower"])
         s[~s_mask_bool] = 1.0
         self.s_mask_ = s_mask_bool
+        self.s_lower_ = None if flat["s_lower"] is None else flat["s_lower"].copy()
 
         scalar_K = (
             float(self.initial_scalar_K)
@@ -801,12 +1209,16 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             assignments = rng.integers(0, self.n_subtypes, size=n_patients)
 
         beta = flat["initial_beta"]
+        c = self._initial_c(n_biomarkers)
+        if self.fit_intercept:
+            cb = self._resolve_c_bounds(n_biomarkers)
+            c = np.clip(c, cb[:, 0], cb[:, 1])
         X_preds = precompute_trajectories(
             cluster_f, self.K, self.t_span, scalar_K, kappa,
             ode_method=self.ode_method,
         )
         sse_mat = sse_matrix(
-            flat["X_obs"],
+            flat["X_obs"] - c[None, :],
             flat["dt"],
             flat["ids"],
             beta,
@@ -845,9 +1257,18 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         solver_hist = [""] * T
         assign_change_hist = np.zeros(T, dtype=int)
 
+        beta_upper = flat["beta_upper"]
+        subtype_counts_hist = np.zeros((self.n_subtypes, T), dtype=int)
+        beta_at_upper_hist = np.zeros(T, dtype=float)
+        estep_moves_hist = np.zeros(T, dtype=int)
+        subtype_counts_hist[:, 0] = np.bincount(assignments, minlength=self.n_subtypes)
+        beta_at_upper_hist[0] = np.mean(beta >= beta_upper - _AT_UPPER_TOL)
+
         return dict(
             current_beta=beta.copy(),
             current_s=s,
+            current_c=c,
+            c_hist=[c.copy()],
             current_kappa=kappa,
             current_scalar_K=scalar_K,
             cluster_f=cluster_f,
@@ -866,6 +1287,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             iter_time_hist=iter_time_hist,
             solver_hist=solver_hist,
             assign_change_hist=assign_change_hist,
+            subtype_counts_hist=subtype_counts_hist,
+            beta_at_upper_hist=beta_at_upper_hist,
+            estep_moves_hist=estep_moves_hist,
+            estep_beta_moves=0,
+            beta_upper=beta_upper,
             best_lse=np.inf,
             loop_iter=0,
             final_lse=initial_lse,
@@ -974,11 +1400,13 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         ids = flat["ids"]
         cog = flat["cog"]
         unique_ids = np.unique(ids)
+        state["estep_beta_moves"] = 0
 
         # globals_trajectories is solved at the converged globals with this same
-        # cluster_f, so the E-step below can reuse it. Ordering dependency: the
-        # per-subtype fit_theta_cluster loop must stay AFTER the E-step, or this
-        # cache goes stale silently (wrong assignments, not a crash).
+        # cluster_f, so the E-step below (hard, jittered or joint-grid) can reuse
+        # it. Ordering dependency: the per-subtype fit_theta_cluster loop must
+        # stay AFTER the E-step, or this cache goes stale silently (wrong
+        # assignments, not a crash).
         (
             state["current_s"],
             state["current_kappa"],
@@ -1002,6 +1430,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 scalar_K_center=self.scalar_K_center,
                 fit_s=self.fit_s,
                 s_mask=self.s_mask_,
+                s_lower=flat["s_lower"],
                 assignments=state["assignments"],
                 cluster_f=state["cluster_f"],
                 strict_tol=self.strict_tol,
@@ -1035,6 +1464,29 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 X_preds=globals_trajectories,
             )
             self.assignment_probabilities_ = probs
+        elif self.estep_mode == "joint_grid":
+            state["assignments"], beta_start = update_assignments_joint_grid(
+                X_obs,
+                dt,
+                ids,
+                cog,
+                state["current_beta"],
+                state["cluster_f"],
+                state["current_scalar_K"],
+                state["current_kappa"],
+                state["current_s"],
+                self.K,
+                self.t_span,
+                state["cluster_cog_a"],
+                state["cluster_cog_b"],
+                self.lambda_cog,
+                self._estep_beta_grid(),
+                beta_upper=flat["beta_upper"],
+                ode_method=self.ode_method,
+                obs_weight=flat["obs_weight"],
+                X_preds=globals_trajectories,
+            )
+            self._apply_beta_start(state, beta_start)
         else:
             state["assignments"] = update_assignments_hard(
                 X_obs,
@@ -1114,9 +1566,16 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             strict_tol=self.strict_tol,
             ode_method=self.ode_method,
             obs_weight=flat["obs_weight"],
+            beta_upper=flat["beta_upper"],
         )
 
         return lse
+
+    @staticmethod
+    def _apply_beta_start(state, beta_start):
+        """Adopt the joint-grid E-step's beta before cog regression, f and beta steps."""
+        state["estep_beta_moves"] = int(np.sum(beta_start != state["current_beta"]))
+        state["current_beta"] = np.asarray(beta_start, dtype=float).copy()
 
     def _use_jitter(self, loop_iter):
         """Whether this outer iteration uses the jittered (sampled) E-step."""
@@ -1156,6 +1615,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             fit_theta_globals_jax,
             solve_trajectories_jax,
             update_assignments_hard_jax,
+            update_assignments_joint_grid_jax,
             update_assignments_jitter_jax,
         )
 
@@ -1164,11 +1624,16 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         ids = flat["ids"]
         cog = flat["cog"]
         packed = flat["jax"]["packed"]
+        state["estep_beta_moves"] = 0
+
+        if self.fit_intercept:
+            return self._em_step_jax_intercept(state, flat)
 
         # globals_trajectories is solved at the converged globals with this same
-        # cluster_f, so the E-step below can reuse it. Ordering dependency: the
-        # joint fit_theta_cluster_all_jax call must stay AFTER the E-step, or this
-        # cache goes stale silently (wrong assignments, not a crash).
+        # cluster_f, so the E-step below (hard, jittered or joint-grid) can reuse
+        # it. Ordering dependency: the joint fit_theta_cluster_all_jax call must
+        # stay AFTER the E-step, or this cache goes stale silently (wrong
+        # assignments, not a crash).
         (
             state["current_s"],
             state["current_kappa"],
@@ -1190,6 +1655,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             scalar_K_center=self.scalar_K_center,
             fit_s=self.fit_s,
             s_mask=self.s_mask_,
+            s_lower=flat["s_lower"],
             assignments=state["assignments"],
             cluster_f=state["cluster_f"],
             strict_tol=self.strict_tol,
@@ -1197,6 +1663,24 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             packed=packed,
         )
 
+        return self._em_step_jax_after_globals(state, flat, globals_trajectories)
+
+    def _em_step_jax_after_globals(self, state, flat, globals_trajectories):
+        """E-step, cog regression, cluster f and beta steps of a JAX EM iteration."""
+        from .optimizer_jax import (
+            estimate_beta_jax,
+            fit_theta_cluster_all_jax,
+            solve_trajectories_jax,
+            update_assignments_hard_jax,
+            update_assignments_joint_grid_jax,
+            update_assignments_jitter_jax,
+        )
+
+        X_obs = flat["X_obs"]
+        dt = flat["dt"]
+        ids = flat["ids"]
+        cog = flat["cog"]
+        packed = flat["jax"]["packed"]
         loop_iter = state["loop_iter"]
         estep_args = (
             X_obs,
@@ -1224,6 +1708,16 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 packed=packed,
             )
             self.assignment_probabilities_ = probs
+        elif self.estep_mode == "joint_grid":
+            state["assignments"], beta_start = update_assignments_joint_grid_jax(
+                *estep_args,
+                self._estep_beta_grid(),
+                beta_upper=flat["beta_upper"],
+                obs_weight=flat["obs_weight"],
+                X_preds=globals_trajectories,
+                packed=packed,
+            )
+            self._apply_beta_start(state, beta_start)
         else:
             state["assignments"] = update_assignments_hard_jax(
                 *estep_args,
@@ -1286,10 +1780,67 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             t_max=self.t_max,
             strict_tol=self.strict_tol,
             obs_weight=flat["obs_weight"],
+            beta_upper=flat["beta_upper"],
             packed=packed,
         )
 
         return lse
+
+    def _em_step_jax_intercept(self, state, flat):
+        """
+        One JAX EM iteration with a fitted intercept ``c`` (prediction ``c + s * x``).
+
+        The globals step fits (s, kappa, scalar_K, c) on the unshifted data. All
+        later steps of the iteration run unchanged on ``X - c``.
+        """
+        from . import jax_core as jc
+        from .optimizer_jax import fit_theta_globals_intercept_jax
+
+        raw_data, meta = flat["jax"]["packed_raw"]
+        B = flat["n_biomarkers"]
+        c_bounds = self._resolve_c_bounds(B)
+        if self.c_mask is not None:
+            fixed = ~np.asarray(self.c_mask, dtype=bool)
+            c_bounds[fixed, 0] = c_bounds[fixed, 1] = state["current_c"][fixed]
+        (
+            state["current_s"],
+            state["current_kappa"],
+            state["current_scalar_K"],
+            state["current_c"],
+            globals_trajectories,
+        ) = fit_theta_globals_intercept_jax(
+            X_obs=flat["X_obs"],
+            dt_obs=flat["dt"],
+            ids=flat["ids"],
+            K=self.K,
+            t_span=self.t_span,
+            cluster_f=state["cluster_f"],
+            assignments=state["assignments"],
+            beta_pred=state["current_beta"],
+            s_guess=state["current_s"],
+            scalar_K_guess=state["current_scalar_K"],
+            kappa_guess=state["current_kappa"],
+            c_guess=state["current_c"],
+            c_bounds=c_bounds,
+            c_center=self.c_center,
+            lambda_c=self.lambda_c,
+            lambda_scalar=self.lambda_scalar,
+            lambda_kappa=self.lambda_kappa,
+            scalar_K_center=self.scalar_K_center,
+            fit_s=self.fit_s,
+            strict_tol=self.strict_tol,
+            obs_weight=flat["obs_weight"],
+            s_mask=self.s_mask_,
+            s_lower=flat["s_lower"],
+            packed=(raw_data, meta),
+        )
+        c = state["current_c"]
+        shifted_flat = dict(flat)
+        shifted_flat["X_obs"] = flat["X_obs"] - c[None, :]
+        shifted_flat["jax"] = dict(
+            flat["jax"], packed=(jc._shift_data_jit(raw_data, jc.f64(c)), meta)
+        )
+        return self._em_step_jax_after_globals(state, shifted_flat, globals_trajectories)
 
     def _finalize_fit(self, state, flat, X):
         """Trim history arrays and copy fitted attributes onto self."""
@@ -1306,12 +1857,18 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.iter_times = state["iter_time_hist"][1:_h]
         self.accepted_solver_stages = state["solver_hist"][1:_h]
         self.assign_changes = state["assign_change_hist"][1:_h]
+        self.subtype_counts_history_ = state["subtype_counts_hist"][:, :_h]
+        self.beta_at_upper_fraction_history_ = state["beta_at_upper_hist"][:_h]
+        self.estep_beta_moves_history_ = state["estep_moves_hist"][:_h]
 
         self.cluster_f = state["cluster_f"]
         self.final_scalar_K = state["current_scalar_K"]
         self.final_s = state["current_s"]
+        self.final_c = np.copy(state["current_c"])
+        self.c_history_ = np.array(state["c_hist"])
         self.final_kappa = state["current_kappa"]
         self.final_assignments = state["assignments"]
+        self.beta_upper_ = np.copy(flat["beta_upper"])
         self.subtype_mapping = None
 
         has_true = X is not None and len(X) > 0 and "subtype_true" in X[0]
@@ -1360,7 +1917,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self._var_per_biomarker_null = flat["var_per_biomarker_null"]
         self._n_obs_rows = flat["X_obs"].shape[0]
         self._sse_per_biomarker = compute_sse_per_biomarker(
-            flat["X_obs"],
+            flat["X_obs"] - self.final_c[None, :],
             flat["dt"],
             flat["ids"],
             state["current_beta"],
@@ -1384,6 +1941,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             fit_s=self.fit_s,
             s_mask=getattr(self, "s_mask_", self.s_mask),
         )
+        k += self._n_free_c(n_biomarkers)
         self.bic_n_params_ = k
         self.bic_ = compute_bic(
             self._sse_per_biomarker,
@@ -1391,6 +1949,16 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.n_obs_,
             k,
         )
+
+    def _n_free_c(self, n_biomarkers: int) -> int:
+        """Number of free intercept entries counted in BIC."""
+        if not self.fit_intercept:
+            return 0
+        bounds = self._resolve_c_bounds(n_biomarkers)
+        free = bounds[:, 0] < bounds[:, 1]
+        if self.c_mask is not None:
+            free &= np.asarray(self.c_mask, dtype=bool)
+        return int(free.sum())
 
     def _bic_n_params(self):
         """Backward-compatible BIC parameter count (same as ``bic_n_params_`` after ``fit``)."""
@@ -1419,6 +1987,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         """Snapshot mutable EM params (not histories)."""
         return dict(
             s=np.copy(state["current_s"]),
+            c=np.copy(state["current_c"]),
             kappa=np.asarray(state["current_kappa"], dtype=float).copy(),
             scalar_K=float(state["current_scalar_K"]),
             cluster_f=[np.ravel(fc).copy() for fc in state["cluster_f"]],
@@ -1431,6 +2000,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     @staticmethod
     def _restore_checkpoint(state, ck):
         state["current_s"] = np.copy(ck["s"])
+        state["current_c"] = np.copy(ck["c"])
         state["current_kappa"] = np.copy(ck["kappa"])
         state["current_scalar_K"] = ck["scalar_K"]
         state["cluster_f"] = [fc.copy() for fc in ck["cluster_f"]]
@@ -1485,6 +2055,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             cluster_cog_a=np.array(state["cluster_cog_a"], dtype=float),
             cluster_cog_b=np.array(state["cluster_cog_b"], dtype=float),
             final_s=np.copy(state["current_s"]),
+            final_c=np.copy(state["current_c"]),
             final_kappa=np.copy(state["current_kappa"]),
             final_scalar_K=float(state["current_scalar_K"]),
             beta_history=np.copy(state["beta_hist"][:, :_h]),
@@ -1498,6 +2069,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             assign_changes=np.copy(state["assign_change_hist"][1:_h]),
             theta_solver_stages=np.array(self.theta_solver_stages, dtype=object),
             max_iter=int(self.max_iter),
+            beta_upper=np.copy(flat["beta_upper"]),
+            subtype_counts_history=np.copy(state["subtype_counts_hist"][:, :_h]),
+            beta_at_upper_fraction_history=np.copy(state["beta_at_upper_hist"][:_h]),
+            estep_beta_moves_history=np.copy(state["estep_moves_hist"][:_h]),
         )
 
         # np.savez appends ".npz"; use a .tmp stem so the temp file is <path>.tmp.npz
@@ -1526,7 +2101,15 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             ]
         )
         state["kappa_hist"][:, hist_idx] = state["current_kappa"]
+        state["c_hist"].append(np.copy(state["current_c"]))
         state["lse_hist"][hist_idx] = lse
+        state["subtype_counts_hist"][:, hist_idx] = np.bincount(
+            state["assignments"], minlength=self.n_subtypes
+        )
+        state["beta_at_upper_hist"][hist_idx] = np.mean(
+            state["current_beta"] >= state["beta_upper"] - _AT_UPPER_TOL
+        )
+        state["estep_moves_hist"][hist_idx] = state["estep_beta_moves"]
         for z in range(self.n_subtypes):
             state["cog_reg_hist"][z, :, hist_idx] = np.concatenate(
                 [state["cluster_cog_a"][z], [state["cluster_cog_b"][z]]]

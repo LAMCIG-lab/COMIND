@@ -465,6 +465,7 @@ class Hyp(NamedTuple):
     beta_mean: jnp.ndarray
     beta_var: jnp.ndarray
     lambda_jsd: jnp.ndarray
+    lambda_c: jnp.ndarray
 
 
 _HYP_DEFAULTS = dict(
@@ -478,6 +479,7 @@ _HYP_DEFAULTS = dict(
     beta_mean=0.0,
     beta_var=1.0,
     lambda_jsd=0.0,
+    lambda_c=0.0,
 )
 
 
@@ -627,6 +629,59 @@ def globals_loss(
         + lognorm
         + hyp.lambda_kappa * jnp.sum(kappa)
     )
+
+
+def shift_data(data: PackedData, c: jnp.ndarray) -> PackedData:
+    """
+    Subtract a per-biomarker intercept from the observations.
+
+    The model with an intercept predicts ``c + s * x``. Its residual
+    ``X - c - s * x`` equals the no-intercept residual on ``X - c``, so every
+    step except the one that fits ``c`` runs unchanged on the shifted data.
+    Missing and padding entries have weight 0, so shifting them is harmless.
+
+    Parameters
+    ----------
+    data : PackedData
+    c : jnp.ndarray
+        Intercept, shape (B,).
+
+    Returns
+    -------
+    PackedData
+        Same arrays, with ``X - c``.
+    """
+    return data._replace(X=data.X - c[None, :])
+
+
+def globals_loss_intercept(
+    s: jnp.ndarray,
+    kappa: jnp.ndarray,
+    scalar_K: jnp.ndarray,
+    c: jnp.ndarray,
+    F: jnp.ndarray,
+    beta_full: jnp.ndarray,
+    assign_full: jnp.ndarray,
+    data: PackedData,
+    K: jnp.ndarray,
+    hyp: Hyp,
+    h: jnp.ndarray,
+    c_center: jnp.ndarray,
+    n_steps: int,
+    s_free: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    """
+    ``globals_loss`` with a per-biomarker intercept ``c`` fitted jointly.
+
+    Prediction for row r: ``c + s * x_z(dt + beta)``. ``data`` holds the
+    unshifted observations. Adds the optional ridge
+    ``lambda_c * sum((c - c_center)**2)`` that anchors ``c`` softly.
+    """
+    loss = globals_loss(
+        s, kappa, scalar_K, F, beta_full, assign_full, shift_data(data, c), K,
+        hyp, h, n_steps=n_steps, s_free=s_free,
+    )
+    return loss + hyp.lambda_c * jnp.sum((c - c_center) ** 2)
 
 
 def cluster_loss(
@@ -868,8 +923,35 @@ def sse_matrix_jax(
     jnp.ndarray
         Shape (P, Z). Padding patients get 0 in every column.
     """
-    Z = traj.shape[0]
     P = beta_full.shape[0]
+    per_row = sse_rows_jax(traj, s, beta_full, data, cog_a, cog_b, lambda_cog, h)
+    return jax.ops.segment_sum(per_row, data.ids, num_segments=P)
+
+
+def sse_rows_jax(
+    traj: jnp.ndarray,
+    s: jnp.ndarray,
+    beta_full: jnp.ndarray,
+    data: PackedData,
+    cog_a: jnp.ndarray,
+    cog_b: jnp.ndarray,
+    lambda_cog: jnp.ndarray,
+    h: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Per-row (visit-level) loss against every subtype; ``sse_matrix_jax`` sums it per patient.
+
+    Parameters
+    ----------
+    See ``sse_matrix_jax``.
+
+    Returns
+    -------
+    jnp.ndarray
+        Shape (R, Z): the visit's weighted reconstruction SSE plus
+        ``lambda_cog * (t - cog_pred_z)**2``. Padding rows get 0.
+    """
+    Z = traj.shape[0]
     t = data.dt + beta_full[data.ids]
     zeros = jnp.zeros_like(data.ids)
 
@@ -880,8 +962,103 @@ def sse_matrix_jax(
         cog_pred = data.cog @ cog_a[zi] + cog_b[zi]
         return rec + lambda_cog * data.row_valid * (t - cog_pred) ** 2
 
-    per_row = jax.vmap(per_subtype)(jnp.arange(Z, dtype=jnp.int32))  # (Z, R)
-    return jax.ops.segment_sum(per_row.T, data.ids, num_segments=P)
+    return jax.vmap(per_subtype)(jnp.arange(Z, dtype=jnp.int32)).T
+
+
+def joint_grid_losses_jax(
+    traj: jnp.ndarray,
+    s: jnp.ndarray,
+    candidates: jnp.ndarray,
+    data: PackedData,
+    cog_a: jnp.ndarray,
+    cog_b: jnp.ndarray,
+    lambda_cog: jnp.ndarray,
+    h: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    ``sse_matrix_jax`` at every row of a candidate-β table.
+
+    Parameters
+    ----------
+    traj : jnp.ndarray
+        Trajectories, shape (Z, T, B).
+    s : jnp.ndarray
+        Output scale, shape (B,).
+    candidates : jnp.ndarray
+        Padded candidate βs, shape (C, P). Traced; C enters only through the
+        shape, so each candidate count compiles once.
+    data : PackedData
+    cog_a, cog_b, lambda_cog, h
+        As in ``sse_matrix_jax``.
+
+    Returns
+    -------
+    jnp.ndarray
+        Shape (C, P, Z).
+    """
+    return jax.vmap(
+        lambda beta_c: sse_matrix_jax(traj, s, beta_c, data, cog_a, cog_b, lambda_cog, h)
+    )(candidates)
+
+
+def joint_grid_select(
+    traj: jnp.ndarray,
+    s: jnp.ndarray,
+    candidates: jnp.ndarray,
+    data: PackedData,
+    cog_a: jnp.ndarray,
+    cog_b: jnp.ndarray,
+    lambda_cog: jnp.ndarray,
+    beta_upper_full: jnp.ndarray,
+    h: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Joint (candidate β, subtype) argmin per patient, matching ``assignments.select_joint_grid``.
+
+    Parameters
+    ----------
+    traj : jnp.ndarray
+        Trajectories, shape (Z, T, B).
+    s : jnp.ndarray
+        Output scale, shape (B,).
+    candidates : jnp.ndarray
+        Padded candidate βs, shape (C, P). For the E-step row 0 is the current
+        β and rows 1.. are the grid (C = G + 1); for ``transform`` it is the
+        grid only.
+    data : PackedData
+    cog_a, cog_b : jnp.ndarray
+        Shapes (Z, C_cog) and (Z,).
+    lambda_cog : jnp.ndarray
+        Weight of the cognitive term (0 disables it).
+    beta_upper_full : jnp.ndarray
+        Padded per-patient upper bound, shape (P,). Candidates above it get
+        loss ``+inf``. Padding patients should get ``t_max``; their losses are
+        0 and never affect real patients.
+    h : jnp.ndarray
+        Grid spacing.
+
+    Returns
+    -------
+    best_beta : jnp.ndarray
+        Chosen candidate β, shape (P,).
+    best_z : jnp.ndarray
+        Chosen subtype, shape (P,), int32.
+
+    Notes
+    -----
+    The argmin runs over the candidate-major flattening of the (C, Z) table,
+    so ties go to the lower candidate index, then the lower subtype index.
+    """
+    losses = joint_grid_losses_jax(traj, s, candidates, data, cog_a, cog_b, lambda_cog, h)
+    valid = candidates <= beta_upper_full[None, :]
+    losses = jnp.where(valid[:, :, None], losses, jnp.inf)
+    C, P, Z = losses.shape
+    flat = jnp.transpose(losses, (1, 0, 2)).reshape(P, C * Z)
+    idx = jnp.argmin(flat, axis=1).astype(jnp.int32)
+    best_c = idx // Z
+    best_z = idx % Z
+    best_beta = jnp.take_along_axis(candidates, best_c[None, :], axis=0)[0]
+    return best_beta, best_z
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +1070,11 @@ _globals_vg = jax.jit(
     jax.value_and_grad(globals_loss, argnums=(0, 1, 2)),
     static_argnames=("n_steps",),
 )
+_globals_c_vg = jax.jit(
+    jax.value_and_grad(globals_loss_intercept, argnums=(0, 1, 2, 3)),
+    static_argnames=("n_steps",),
+)
+_shift_data_jit = jax.jit(shift_data)
 _cluster_vg = jax.jit(
     jax.value_and_grad(cluster_loss, argnums=0),
     static_argnames=("n_steps",),
@@ -903,12 +1085,22 @@ _beta_vg = jax.jit(
 )
 _recon_sse_jit = jax.jit(recon_sse)
 _sse_matrix_jit = jax.jit(sse_matrix_jax)
+_joint_grid_select_jit = jax.jit(joint_grid_select)
+_joint_grid_losses_jit = jax.jit(joint_grid_losses_jax)
+_sse_rows_jit = jax.jit(sse_rows_jax)
 
 JITTED_FUNCTIONS = {
     "_traj_jit": _traj_jit,
     "_globals_vg": _globals_vg,
+    "_globals_c_vg": _globals_c_vg,
+    "_shift_data_jit": _shift_data_jit,
     "_cluster_vg": _cluster_vg,
     "_beta_vg": _beta_vg,
     "_recon_sse_jit": _recon_sse_jit,
     "_sse_matrix_jit": _sse_matrix_jit,
+    "_joint_grid_select_jit": _joint_grid_select_jit,
+    "_joint_grid_losses_jit": _joint_grid_losses_jit,
+    "_sse_rows_jit": _sse_rows_jit,
 }
+
+TRANSFORM_ONLY_JITTED = ("_joint_grid_losses_jit", "_sse_rows_jit")

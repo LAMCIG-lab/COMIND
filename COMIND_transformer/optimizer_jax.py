@@ -24,7 +24,8 @@ import numpy as np
 from scipy.optimize import minimize
 
 from . import jax_core as jc
-from .optimizer_theta_globals import SCALAR_K_CENTER, resolve_s_mask
+from .optimizer_beta import _beta_bounds
+from .optimizer_theta_globals import SCALAR_K_CENTER, _s_bounds, resolve_s_mask
 
 _STRICT_OPTIONS = {"maxiter": 200, "ftol": 2.2e-10, "gtol": 1e-6}
 _NONFINITE_LOSS = 1e30
@@ -213,6 +214,7 @@ def fit_theta_globals_jax(
     ode_method: str = "LSODA",
     obs_weight: np.ndarray = None,
     s_mask=None,
+    s_lower: np.ndarray = None,
     *,
     packed: Optional[tuple] = None,
     info: Optional[dict] = None,
@@ -224,7 +226,7 @@ def fit_theta_globals_jax(
     ----------
     X_obs, dt_obs, ids, K, t_span, cluster_f, assignments, beta_pred,
     s_guess, scalar_K_guess, kappa_guess, lambda_s, lambda_scalar,
-    lambda_kappa, scalar_K_center, fit_s, strict_tol, obs_weight, s_mask
+    lambda_kappa, scalar_K_center, fit_s, strict_tol, obs_weight, s_mask, s_lower
         As in ``fit_theta_globals``. ``s_mask`` False entries (and every
         entry when ``fit_s`` is False) are held at 1 with bounds (1, 1).
     method, ode_method
@@ -270,7 +272,10 @@ def fit_theta_globals_jax(
         [s_guess, np.asarray(kappa_guess, dtype=float).ravel(), [float(scalar_K_guess)]]
     )
     bounds = (
-        [(0.0, np.inf) if free else (1.0, 1.0) for free in s_mask_bool]
+        [
+            tuple(b) if free else (1.0, 1.0)
+            for b, free in zip(_s_bounds(s_lower, n_biomarkers).tolist(), s_mask_bool)
+        ]
         + [(0.0, np.inf)] * n_biomarkers
         + [(0.0, np.inf)]
     )
@@ -330,6 +335,137 @@ def fit_theta_globals_jax(
         info.update(nfev=result.nfev, nit=result.nit, message=str(result.message),
                     nonfinite=guard.count)
     return s_fit, kappa_fit, scalar_K_fit, trajectories_to_numpy(traj)
+
+
+def fit_theta_globals_intercept_jax(
+    X_obs: np.ndarray,
+    dt_obs: np.ndarray,
+    ids: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    cluster_f: list,
+    assignments: np.ndarray,
+    beta_pred: np.ndarray,
+    s_guess: np.ndarray,
+    scalar_K_guess: float,
+    kappa_guess: np.ndarray,
+    c_guess: np.ndarray,
+    c_bounds: np.ndarray,
+    c_center: np.ndarray = None,
+    lambda_c: float = 0.0,
+    lambda_scalar: float = 0.0,
+    lambda_kappa: float = 0.0,
+    scalar_K_center: float = SCALAR_K_CENTER,
+    fit_s: bool = True,
+    strict_tol: bool = False,
+    obs_weight: np.ndarray = None,
+    s_mask=None,
+    s_lower: np.ndarray = None,
+    *,
+    packed: Optional[tuple] = None,
+    info: Optional[dict] = None,
+) -> tuple:
+    """
+    ``fit_theta_globals_jax`` plus a per-biomarker intercept ``c``.
+
+    The prediction is ``c + s * x``. ``packed`` must hold the UNSHIFTED data.
+
+    Parameters
+    ----------
+    c_guess : (B,)
+        Starting intercept.
+    c_bounds : (B, 2)
+        Lower and upper bound per biomarker. Equal bounds hold that entry fixed
+        (use this for biomarkers whose zero is already meaningful).
+    c_center, lambda_c
+        Optional ridge ``lambda_c * sum((c - c_center)**2)``. ``c_center=None``
+        means zeros.
+    Other parameters as in ``fit_theta_globals_jax`` (``lambda_s`` is 0).
+
+    Returns
+    -------
+    s_fit, kappa_fit, scalar_K_fit, c_fit, trajectories
+        ``trajectories`` as in ``fit_theta_globals_jax``.
+    """
+    n_biomarkers = X_obs.shape[1]
+    B = n_biomarkers
+    n_patients = len(assignments)
+    data, meta = _get_packed(packed, X_obs, obs_weight, dt_obs, ids, None, n_patients)
+    P = meta["P"]
+    h, n_steps = _grid(t_span)
+
+    s_mask_bool = resolve_s_mask(n_biomarkers, fit_s, s_mask)
+    s_guess = np.asarray(s_guess, dtype=float).ravel().copy()
+    s_guess[~s_mask_bool] = 1.0
+    c_guess = np.asarray(c_guess, dtype=float).ravel()
+    c_bounds = np.asarray(c_bounds, dtype=float).reshape(B, 2)
+    c_guess = np.clip(c_guess, c_bounds[:, 0], c_bounds[:, 1])
+    c_center = np.zeros(B) if c_center is None else np.asarray(c_center, dtype=float).ravel()
+
+    x0 = np.concatenate([
+        s_guess, np.asarray(kappa_guess, dtype=float).ravel(), [float(scalar_K_guess)], c_guess,
+    ])
+    bounds = (
+        [
+            tuple(b) if free else (1.0, 1.0)
+            for b, free in zip(_s_bounds(s_lower, n_biomarkers).tolist(), s_mask_bool)
+        ]
+        + [(0.0, np.inf)] * B
+        + [(0.0, np.inf)]
+        + [(float(lo), float(hi)) for lo, hi in c_bounds]
+    )
+
+    F = jc.f64(_stack_f(cluster_f))
+    beta_full = jc.pad_beta(beta_pred, P)
+    assign_full = jc.pad_assignments(assignments, P)
+    K_j = jc.f64(K)
+    s_free = jc.f64(s_mask_bool.astype(float))
+    c_center_j = jc.f64(c_center)
+    hyp = jc.make_hyp(
+        lambda_scalar=lambda_scalar,
+        scalar_K_center=scalar_K_center,
+        lambda_kappa=lambda_kappa,
+        lambda_c=lambda_c,
+    )
+    guard = _Guard("fit_theta_globals_intercept_jax")
+
+    def objective(params):
+        loss, (gs, gk, gK, gc) = jc._globals_c_vg(
+            jc.f64(params[:B]),
+            jc.f64(params[B:2 * B]),
+            jc.f64(params[2 * B]),
+            jc.f64(params[2 * B + 1:]),
+            F,
+            beta_full,
+            assign_full,
+            data,
+            K_j,
+            hyp,
+            h,
+            c_center_j,
+            n_steps=n_steps,
+            s_free=s_free,
+        )
+        grad = np.concatenate(
+            [np.asarray(gs), np.asarray(gk), np.atleast_1d(np.asarray(gK)), np.asarray(gc)]
+        ).astype(np.float64)
+        return guard.check(float(loss), grad)
+
+    result = minimize(
+        objective, x0=x0, method="L-BFGS-B", jac=True, bounds=bounds,
+        options=_lbfgs_options(strict_tol),
+    )
+    s_fit = np.asarray(result.x[:B], dtype=float).copy()
+    s_fit[~s_mask_bool] = 1.0
+    kappa_fit = np.asarray(result.x[B:2 * B], dtype=float).copy()
+    scalar_K_fit = float(result.x[2 * B])
+    c_fit = np.asarray(result.x[2 * B + 1:], dtype=float).copy()
+
+    traj = jc._traj_jit(F, jc.f64(kappa_fit), jc.f64(scalar_K_fit), K_j, h, n_steps=n_steps)
+    if info is not None:
+        info.update(nfev=result.nfev, nit=result.nit, message=str(result.message),
+                    nonfinite=guard.count)
+    return s_fit, kappa_fit, scalar_K_fit, c_fit, trajectories_to_numpy(traj)
 
 
 def fit_theta_cluster_all_jax(
@@ -473,9 +609,11 @@ def estimate_beta_jax(
     jsd_value_range: tuple = None,
     strict_tol: bool = False,
     obs_weight: np.ndarray = None,
+    beta_upper: np.ndarray = None,
     *,
     packed: Optional[tuple] = None,
     info: Optional[dict] = None,
+    maxiter: Optional[int] = None,
 ) -> tuple:
     """
     JAX version of ``estimate_beta``: optimize all real betas jointly.
@@ -508,10 +646,16 @@ def estimate_beta_jax(
         Add the strict L-BFGS-B options on top of ``maxiter = 100``.
     obs_weight : np.ndarray, optional
         (n_rows, B) observation weight.
+    beta_upper : np.ndarray, optional
+        Per-patient upper bound, shape (n_patients,). ``None`` means ``t_max``
+        for everyone (the original bounds).
     packed : tuple, optional
         ``(PackedData, meta)`` from ``jax_core.pack_data``.
     info : dict, optional
         Filled with ``nfev``, ``nit``, ``message`` and ``nonfinite``.
+    maxiter : int, optional
+        Overrides the L-BFGS-B ``maxiter`` after ``strict_tol`` is applied.
+        ``None`` keeps 100 (200 with ``strict_tol``).
 
     Returns
     -------
@@ -572,13 +716,16 @@ def estimate_beta_jax(
         grad = np.asarray(g, dtype=np.float64)[:n_patients]
         return guard.check(float(loss), grad)
 
+    options = _lbfgs_options(strict_tol, {"maxiter": 100})
+    if maxiter is not None:
+        options["maxiter"] = int(maxiter)
     result = minimize(
         objective,
         x0=np.asarray(beta_all, dtype=float).copy(),
         method="L-BFGS-B",
         jac=True,
-        bounds=[(0, t_max)] * n_patients,
-        options=_lbfgs_options(strict_tol, {"maxiter": 100}),
+        bounds=_beta_bounds(n_patients, t_max, beta_upper),
+        options=options,
     )
     beta_opt = np.asarray(result.x, dtype=float)
 
@@ -671,6 +818,106 @@ def update_assignments_hard_jax(
         lambda_cog, n_patients,
     )
     return np.argmin(sse, axis=1).astype(int)
+
+
+def _pad_upper(beta_upper: Optional[np.ndarray], n_patients: int, P: int, t_max: float):
+    out = np.full(P, float(t_max))
+    if beta_upper is None:
+        out[:n_patients] = np.inf
+    else:
+        out[:n_patients] = np.asarray(beta_upper, dtype=float).ravel()
+    return jc.f64(out)
+
+
+def _grid_candidates(beta_grid: np.ndarray, P: int, beta: Optional[np.ndarray] = None):
+    """(G, P) grid table, with the padded current β prepended when ``beta`` is given."""
+    beta_grid = np.asarray(beta_grid, dtype=float).ravel()
+    rows = np.repeat(beta_grid[:, None], P, axis=1)
+    if beta is not None:
+        rows = np.vstack([np.asarray(jc.pad_beta(beta, P))[None, :], rows])
+    return jc.f64(rows)
+
+
+def update_assignments_joint_grid_jax(
+    X_obs: np.ndarray,
+    dt: np.ndarray,
+    ids: np.ndarray,
+    cog: np.ndarray,
+    beta: np.ndarray,
+    cluster_f: list,
+    scalar_K: float,
+    kappa: np.ndarray,
+    s: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    cluster_cog_a,
+    cluster_cog_b,
+    lambda_cog: float,
+    beta_grid: np.ndarray,
+    beta_upper: np.ndarray = None,
+    ode_method: str = "LSODA",
+    obs_weight: np.ndarray = None,
+    X_preds=None,
+    *,
+    packed: Optional[tuple] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    JAX version of ``assignments.update_assignments_joint_grid``.
+
+    Candidates are the current β (index 0) followed by ``beta_grid``; the
+    joint argmin over (candidate, subtype) comes from
+    ``jax_core.joint_grid_select``. The same guarantee holds: each patient's
+    chosen loss is <= their loss at the current (β, z), since the current β
+    is never masked (effective bound ``max(beta_upper[i], beta[i])``). The
+    full objective may still rise, because the search ignores the JSD term
+    and the β prior.
+
+    Parameters
+    ----------
+    X_obs, dt, ids, cog, beta, cluster_f, scalar_K, kappa, s, K, t_span,
+    cluster_cog_a, cluster_cog_b, lambda_cog, beta_grid, beta_upper, obs_weight
+        As in ``assignments.update_assignments_joint_grid``.
+    ode_method
+        Ignored.
+    X_preds : list of np.ndarray or jax.Array, optional
+        Precomputed trajectories. ``None`` solves with ``_traj_jit``.
+    packed : tuple, optional
+        ``(PackedData, meta)`` from ``jax_core.pack_data``.
+
+    Returns
+    -------
+    assignments : np.ndarray
+        Shape (n_patients,).
+    beta_start : np.ndarray
+        Chosen candidate β per patient, shape (n_patients,).
+    """
+    del ode_method
+    n_patients = len(beta)
+    data, meta = _get_packed(packed, X_obs, obs_weight, dt, ids, cog, n_patients)
+    P = meta["P"]
+    h, _ = _grid(t_span)
+    if X_preds is None:
+        X_preds = solve_trajectories_jax(cluster_f, kappa, scalar_K, K, t_span)
+    traj = trajectories_to_jax(X_preds)
+    A, b = _stack_cog(cluster_cog_a, cluster_cog_b, traj.shape[0], data.cog.shape[1])
+
+    beta = np.asarray(beta, dtype=float)
+    upper = None if beta_upper is None else np.maximum(np.asarray(beta_upper, float), beta)
+    best_beta, best_z = jc._joint_grid_select_jit(
+        traj,
+        jc.f64(np.ravel(s)),
+        _grid_candidates(beta_grid, P, beta),
+        data,
+        jc.f64(A),
+        jc.f64(b),
+        jc.f64(lambda_cog),
+        _pad_upper(upper, n_patients, P, t_span[-1]),
+        h,
+    )
+    return (
+        np.asarray(best_z)[:n_patients].astype(int),
+        np.asarray(best_beta, dtype=np.float64)[:n_patients].copy(),
+    )
 
 
 def update_assignments_jitter_jax(

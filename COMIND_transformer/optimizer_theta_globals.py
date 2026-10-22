@@ -63,6 +63,14 @@ def resolve_s_mask(n_biomarkers: int, fit_s: bool = True, s_mask=None) -> np.nda
     return mask
 
 
+def _s_bounds(s_lower, n_biomarkers: int) -> np.ndarray:
+    """(n_biomarkers, 2) array of ``(lower, inf)`` s bounds; ``s_lower=None`` means 0."""
+    lower = np.zeros(n_biomarkers) if s_lower is None else np.asarray(s_lower, dtype=float).ravel()
+    if lower.shape != (n_biomarkers,):
+        raise ValueError(f"s_lower must have shape ({n_biomarkers},), got {lower.shape}")
+    return np.column_stack([lower, np.full(n_biomarkers, np.inf)])
+
+
 def _unpack_globals(params: np.ndarray, n_biomarkers: int, s_mask: np.ndarray):
     """Unpack (s, kappa, scalar_K); masked-off ``s`` entries are held at 1."""
     s = np.ones(n_biomarkers, dtype=float)
@@ -486,9 +494,14 @@ def fit_theta_globals(
     ode_method: str = "LSODA",
     obs_weight: np.ndarray = None,
     s_mask=None,
+    s_lower: np.ndarray = None,
 ) -> tuple:
     """
     Optimizes global (s, kappa, scalar_K) using assignment-aware subtype trajectories.
+
+    s_lower:
+        Optional (n_biomarkers,) lower bound on each free s entry. ``None``
+        (default) means 0 for every entry.
 
     fit_s:
         If True (default), optimize per-biomarker s (subject to ``s_mask``).
@@ -540,9 +553,7 @@ def fit_theta_globals(
             [s_guess[s_mask_bool], kappa_guess, [scalar_K_guess]]
         )
         bounds = (
-
-            # TODO: change s to be top bounded by 1/max(biom value)
-            [(0.0, np.inf)] * n_free_s
+            [tuple(b) for b in _s_bounds(s_lower, n_biomarkers)[s_mask_bool].tolist()]
             + [(0.0, np.inf)] * n_biomarkers
             + [(0.0, np.inf)]
         )

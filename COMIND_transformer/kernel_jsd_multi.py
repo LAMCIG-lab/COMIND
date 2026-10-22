@@ -31,6 +31,7 @@ class KernelJSDMulti:
         else:
             self.h = bandwidth
         self.eps = 1e-10
+        self._densities = None
     
     def _gaussian_kernel(self, x):
         return np.exp(-0.5 * x**2) / np.sqrt(2 * np.pi)
@@ -39,13 +40,16 @@ class KernelJSDMulti:
         return -x * self._gaussian_kernel(x)
     
     def _estimate_densities(self):
-        densities = []
-        for dist in self.distributions:
-            dist_scaled = (self.bins[:, None] - dist[None, :]) / self.h
-            P = np.mean(self._gaussian_kernel(dist_scaled), axis=1) / self.h
-            P = P / (P.sum() + self.eps)
-            densities.append(P)
-        return densities
+        """Normalized KDE per distribution, computed once and shared by jsd() and jsd_derivatives()."""
+        if self._densities is None:
+            densities = []
+            for dist in self.distributions:
+                dist_scaled = (self.bins[:, None] - dist[None, :]) / self.h
+                P = np.mean(self._gaussian_kernel(dist_scaled), axis=1) / self.h
+                P = P / (P.sum() + self.eps)
+                densities.append(P)
+            self._densities = densities
+        return list(self._densities)
     
     def jsd(self):
         """Compute Jensen-Shannon Divergence for N distributions.
@@ -83,17 +87,13 @@ class KernelJSDMulti:
             coeff = (1.0 / self.n_distributions) * np.log(P / M)
             coeffs.append(coeff)
         
-        # Compute gradients for each distribution
+        # One row per sample, (n_samples, n_bins) C-contiguous: row sums keep the
+        # per-sample np.sum order of the original loop, so results are bit-identical.
         gradients = []
         for dist_idx, dist in enumerate(self.distributions):
-            d_dist = np.zeros(len(dist))
-            coeff = coeffs[dist_idx]
-            
-            for i, val in enumerate(dist):
-                dist_scaled = (self.bins - val) / self.h
-                kernel_deriv = -self._gaussian_kernel_derivative(dist_scaled) / self.h
-                d_dist[i] = np.sum(coeff * kernel_deriv) / (len(dist) * self.h)
-            
+            dist_scaled = (self.bins[None, :] - dist[:, None]) / self.h
+            kernel_deriv = -self._gaussian_kernel_derivative(dist_scaled) / self.h
+            d_dist = np.sum(coeffs[dist_idx] * kernel_deriv, axis=1) / (len(dist) * self.h)
             gradients.append(d_dist)
         
         return gradients

@@ -8,7 +8,7 @@ assignment updaters share precomputed subtype trajectories.
 import numpy as np
 
 from .optimizer_beta import reconstruction_sse
-from .utils import solve_system
+from .utils import interp_uniform, solve_system
 
 
 def precompute_trajectories(cluster_f, K, t_span, scalar_K, kappa, ode_method="LSODA"):
@@ -142,6 +142,183 @@ def update_assignments_hard(
         obs_weight=obs_weight,
     )
     return np.argmin(sse, axis=1).astype(int)
+
+
+def joint_grid_losses(
+    X_obs,
+    dt,
+    ids,
+    candidates,
+    X_preds,
+    s,
+    t_span,
+    cog=None,
+    cluster_cog_a=None,
+    cluster_cog_b=None,
+    lambda_cog=0.0,
+    obs_weight=None,
+):
+    """
+    ``sse_matrix`` evaluated at every row of a candidate-β table.
+
+    Parameters
+    ----------
+    X_obs : (n_rows, n_biomarkers)
+        Observations with missing entries filled (see ``utils.split_observed``).
+    dt, ids : (n_rows,)
+    candidates : (n_candidates, n_patients)
+        Candidate β per patient; row c is one β vector.
+    X_preds : list of (n_biomarkers, len(t_span))
+    s : (n_biomarkers,)
+    t_span : (T,)
+    cog, cluster_cog_a, cluster_cog_b, lambda_cog
+        Cognitive term, included under the same condition as ``sse_matrix``.
+    obs_weight : (n_rows, n_biomarkers) or None
+
+    Returns
+    -------
+    np.ndarray
+        Shape (n_candidates, n_patients, n_subtypes). Entry ``[c, i, z]`` is
+        ``sse_matrix`` at ``beta = candidates[c]``, patient i, subtype z (up to
+        summation order).
+    """
+    candidates = np.atleast_2d(np.asarray(candidates, dtype=float))
+    unique_ids, row_pidx = np.unique(ids, return_inverse=True)
+    n_patients = len(unique_ids)
+    n_subtypes = len(X_preds)
+    use_cog = (
+        lambda_cog > 0
+        and cog is not None
+        and cluster_cog_a is not None
+        and cluster_cog_b is not None
+    )
+    s = np.asarray(s, dtype=float)
+    scaled = [s[:, None] * np.asarray(X_preds[z]) for z in range(n_subtypes)]
+    dts = np.diff(t_span)
+    slopes = [np.diff(y, axis=1) / dts for y in scaled]
+    cog_pred = (
+        [cog @ cluster_cog_a[z] + cluster_cog_b[z] for z in range(n_subtypes)]
+        if use_cog else None
+    )
+
+    out = np.zeros((candidates.shape[0], n_patients, n_subtypes))
+    for c, beta_c in enumerate(candidates):
+        t = dt + beta_c[row_pidx]
+        for z in range(n_subtypes):
+            pred = interp_uniform(scaled[z], t, t_span, slopes[z]).T
+            r = X_obs - pred
+            if obs_weight is not None:
+                r = r * obs_weight
+            per_row = np.sum(r ** 2, axis=1)
+            if use_cog:
+                per_row = per_row + lambda_cog * (t - cog_pred[z]) ** 2
+            out[c, :, z] = np.bincount(row_pidx, weights=per_row, minlength=n_patients)
+    return out
+
+
+def select_joint_grid(losses, candidates, beta_upper=None):
+    """
+    Joint (candidate β, subtype) argmin per patient.
+
+    Parameters
+    ----------
+    losses : (n_candidates, n_patients, n_subtypes)
+    candidates : (n_candidates, n_patients)
+    beta_upper : (n_patients,) or None
+        Candidates above a patient's bound get loss ``+inf``.
+
+    Returns
+    -------
+    assignments : (n_patients,) int
+    beta_start : (n_patients,) float
+
+    Notes
+    -----
+    The argmin is over the candidate-major flattening, so on ties the lowest
+    candidate index wins and, within one candidate, the lowest subtype index
+    wins (as ``np.argmin`` does in the hard E-step).
+    """
+    losses = np.array(losses, dtype=float, copy=True)
+    n_cand, n_patients, n_subtypes = losses.shape
+    if beta_upper is not None:
+        losses[candidates > np.asarray(beta_upper)[None, :]] = np.inf
+    flat = losses.transpose(1, 0, 2).reshape(n_patients, n_cand * n_subtypes)
+    idx = np.argmin(flat, axis=1)
+    best_c = idx // n_subtypes
+    best_z = idx % n_subtypes
+    return best_z.astype(int), candidates[best_c, np.arange(n_patients)].astype(float)
+
+
+def update_assignments_joint_grid(
+    X_obs,
+    dt,
+    ids,
+    cog,
+    beta,
+    cluster_f,
+    scalar_K,
+    kappa,
+    s,
+    K,
+    t_span,
+    cluster_cog_a,
+    cluster_cog_b,
+    lambda_cog,
+    beta_grid,
+    beta_upper=None,
+    ode_method="LSODA",
+    obs_weight=None,
+    X_preds=None,
+):
+    """
+    Joint-grid E-step: choose each patient's (β, subtype) pair jointly.
+
+    For patient i the candidates are their current β (index 0) followed by
+    ``beta_grid``. Candidates above ``beta_upper[i]`` are skipped. Every
+    (candidate, subtype) pair is scored with the ``sse_matrix`` patient loss
+    (reconstruction SSE plus the ``lambda_cog`` term), and the joint argmin is
+    taken with ties going to the current β, then to the lower subtype index.
+
+    Guarantee: each patient's chosen loss is <= their loss at the current
+    (β, z), because that pair is always a candidate. The current β is never
+    masked: the effective bound is ``max(beta_upper[i], beta[i])``.
+
+    Not guaranteed: the full EM objective can still rise, because this search
+    ignores the JSD term and the β prior. The β step that follows optimizes
+    the full objective from ``beta_start``.
+
+    Parameters
+    ----------
+    X_obs, dt, ids, cog, beta, cluster_f, scalar_K, kappa, s, K, t_span,
+    cluster_cog_a, cluster_cog_b, lambda_cog, ode_method, obs_weight, X_preds
+        As in ``update_assignments_hard``.
+    beta_grid : (G,)
+        Grid candidates (see ``utils.make_beta_grid``).
+    beta_upper : (n_patients,) or None
+        Per-patient β upper bound. ``None`` means no bound.
+
+    Returns
+    -------
+    assignments : (n_patients,) int
+    beta_start : (n_patients,) float
+        The chosen candidate β per patient; the β step warm-starts from it.
+    """
+    if X_preds is None:
+        X_preds = precompute_trajectories(
+            cluster_f, K, t_span, scalar_K, kappa, ode_method=ode_method
+        )
+    beta = np.asarray(beta, dtype=float)
+    beta_grid = np.asarray(beta_grid, dtype=float).ravel()
+    candidates = np.vstack(
+        [beta[None, :], np.repeat(beta_grid[:, None], len(beta), axis=1)]
+    )
+    losses = joint_grid_losses(
+        X_obs, dt, ids, candidates, X_preds, s, t_span,
+        cog=cog, cluster_cog_a=cluster_cog_a, cluster_cog_b=cluster_cog_b,
+        lambda_cog=lambda_cog, obs_weight=obs_weight,
+    )
+    upper = None if beta_upper is None else np.maximum(np.asarray(beta_upper, float), beta)
+    return select_joint_grid(losses, candidates, upper)
 
 
 def update_assignments_jitter(

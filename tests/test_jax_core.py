@@ -653,8 +653,40 @@ def test_no_recompiles():
         em3.fit(fold)
         assert em3.jax_padded_shape_ == (R, P)
 
-        sizes = {name: fn._cache_size() for name, fn in jc.JITTED_FUNCTIONS.items()}
-        assert sizes == {name: 1 for name in jc.JITTED_FUNCTIONS}, sizes
+        for lam_cog, lam_jsd in ((0.0, 0.1), (0.2, 0.6)):
+            SubtypingEM(**common, lambda_cog=lam_cog, lambda_jsd=lam_jsd,
+                        estep_mode="joint_grid", cap_beta_by_followup=True,
+                        initial_assignments=rng.integers(0, 2, len(X))).fit(X)
+
+        # Intercept-only jits (_globals_c_vg, _shift_data_jit) compile once on
+        # the same padded shape; they must not bump the existing caches.
+        B = K.shape[0]
+        SubtypingEM(
+            **common, fit_intercept=True, c_bounds=(0.0, np.inf),
+            initial_c=np.zeros(B), jax_pad_rows=R, jax_pad_patients=P,
+            lambda_jsd=0.1, lambda_f=0.01, lambda_kappa=0.5,
+            initial_assignments=rng.integers(0, 2, len(X)),
+        ).fit(X)
+
+        def cache_sizes():
+            return {name: fn._cache_size() for name, fn in jc.JITTED_FUNCTIONS.items()}
+
+        sizes = cache_sizes()
+        expected = {name: 0 if name in jc.TRANSFORM_ONLY_JITTED else 1
+                    for name in jc.JITTED_FUNCTIONS}
+        assert sizes == expected, sizes
+
+        # transform shapes differ from the fit's, so the first round may add one
+        # entry per function; a second round with the same padded shape adds none.
+        em1.transform_backend = "jax"
+        em1.transform_pad_rows, em1.transform_pad_patients = 256, 64
+        em1.transform(X[:30])
+        em1.transform_soft(X[:30], per_timepoint=True)
+        after_first = cache_sizes()
+        em1.transform(X[30:], use_cognitive_prior=False)
+        em1.transform_soft(X[30:], temperature=2.0, per_timepoint=True)
+        assert cache_sizes() == after_first
+        assert all(after_first[name] == 1 for name in jc.TRANSFORM_ONLY_JITTED), after_first
     finally:
         jax.config.update("jax_log_compiles", False)
         jax.config.update("jax_explain_cache_misses", False)
