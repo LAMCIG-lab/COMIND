@@ -988,17 +988,26 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         check_beta_grid_within_cap(beta_grid, caps)
         return caps
 
-    def score(self, X: list, y=None) -> float:
-        """Negative per-subtype reconstruction LSE on X (higher = better, for sklearn CV).
+    def score(self, X: list, y=None, per_value: bool = True) -> float:
+        """Negative held-out reconstruction error on X (higher = better).
 
-        Each patient is scored on the trajectory of the subtype ``transform`` assigns,
-        not on a single shared curve.
+        This is the number scikit-learn's ``cross_val_score`` / ``cross_validate``
+        report for each held-out fold. ``transform`` estimates each patient's
+        beta and subtype, and the patient is scored on that subtype's trajectory.
+
+        per_value=True (default): minus the mean squared residual per OBSERVED
+            value (NaN cells are not counted), so folds and data sets with
+            different sizes or amounts of missing data are comparable.
+        per_value=False: minus the total sum of squared residuals (the old
+            behaviour).
         """
         X = self._shift_patients(X)
         transformed = self.transform(X, _shifted=True)
-        return -self._compute_val_score(
-            X, transformed["beta"], transformed["subtype"]
-        )
+        sse = self._compute_val_score(X, transformed["beta"], transformed["subtype"])
+        if not per_value:
+            return -sse
+        n_obs = int(sum(np.isfinite(np.asarray(p["X_obs"], dtype=float)).sum() for p in X))
+        return -sse / max(n_obs, 1)
 
     def compute_subtype_mapping(self, true_f_list, verbose=True):
         """Compute fitted→true subtype mapping by nearest-f matching."""
