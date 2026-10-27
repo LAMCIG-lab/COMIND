@@ -215,6 +215,7 @@ def fit_theta_globals_jax(
     obs_weight: np.ndarray = None,
     s_mask=None,
     s_lower: np.ndarray = None,
+    s_upper=None,
     *,
     packed: Optional[tuple] = None,
     info: Optional[dict] = None,
@@ -274,7 +275,7 @@ def fit_theta_globals_jax(
     bounds = (
         [
             tuple(b) if free else (1.0, 1.0)
-            for b, free in zip(_s_bounds(s_lower, n_biomarkers).tolist(), s_mask_bool)
+            for b, free in zip(_s_bounds(s_lower, n_biomarkers, s_upper).tolist(), s_mask_bool)
         ]
         + [(0.0, np.inf)] * n_biomarkers
         + [(0.0, np.inf)]
@@ -361,6 +362,7 @@ def fit_theta_globals_intercept_jax(
     obs_weight: np.ndarray = None,
     s_mask=None,
     s_lower: np.ndarray = None,
+    s_upper=None,
     *,
     packed: Optional[tuple] = None,
     info: Optional[dict] = None,
@@ -408,7 +410,7 @@ def fit_theta_globals_intercept_jax(
     bounds = (
         [
             tuple(b) if free else (1.0, 1.0)
-            for b, free in zip(_s_bounds(s_lower, n_biomarkers).tolist(), s_mask_bool)
+            for b, free in zip(_s_bounds(s_lower, n_biomarkers, s_upper).tolist(), s_mask_bool)
         ]
         + [(0.0, np.inf)] * B
         + [(0.0, np.inf)]

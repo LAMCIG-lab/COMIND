@@ -63,12 +63,29 @@ def resolve_s_mask(n_biomarkers: int, fit_s: bool = True, s_mask=None) -> np.nda
     return mask
 
 
-def _s_bounds(s_lower, n_biomarkers: int) -> np.ndarray:
-    """(n_biomarkers, 2) array of ``(lower, inf)`` s bounds; ``s_lower=None`` means 0."""
-    lower = np.zeros(n_biomarkers) if s_lower is None else np.asarray(s_lower, dtype=float).ravel()
+def _s_bounds(s_lower, n_biomarkers: int, s_upper=None) -> np.ndarray:
+    """(n_biomarkers, 2) array of ``(lower, upper)`` s bounds.
+
+    ``s_lower=None`` means 0. ``s_upper=None`` means inf. A scalar upper/lower
+    is broadcast to every biomarker.
+    """
+    if s_lower is None:
+        lower = np.zeros(n_biomarkers)
+    else:
+        lower = np.asarray(s_lower, dtype=float).ravel()
+        if lower.size == 1:
+            lower = np.full(n_biomarkers, float(lower[0]))
     if lower.shape != (n_biomarkers,):
         raise ValueError(f"s_lower must have shape ({n_biomarkers},), got {lower.shape}")
-    return np.column_stack([lower, np.full(n_biomarkers, np.inf)])
+    if s_upper is None:
+        upper = np.full(n_biomarkers, np.inf)
+    else:
+        upper = np.asarray(s_upper, dtype=float).ravel()
+        if upper.size == 1:
+            upper = np.full(n_biomarkers, float(upper[0]))
+        if upper.shape != (n_biomarkers,):
+            raise ValueError(f"s_upper must have shape ({n_biomarkers},), got {upper.shape}")
+    return np.column_stack([lower, upper])
 
 
 def _unpack_globals(params: np.ndarray, n_biomarkers: int, s_mask: np.ndarray):
@@ -495,6 +512,7 @@ def fit_theta_globals(
     obs_weight: np.ndarray = None,
     s_mask=None,
     s_lower: np.ndarray = None,
+    s_upper=None,
 ) -> tuple:
     """
     Optimizes global (s, kappa, scalar_K) using assignment-aware subtype trajectories.
@@ -553,7 +571,7 @@ def fit_theta_globals(
             [s_guess[s_mask_bool], kappa_guess, [scalar_K_guess]]
         )
         bounds = (
-            [tuple(b) for b in _s_bounds(s_lower, n_biomarkers)[s_mask_bool].tolist()]
+            [tuple(b) for b in _s_bounds(s_lower, n_biomarkers, s_upper)[s_mask_bool].tolist()]
             + [(0.0, np.inf)] * n_biomarkers
             + [(0.0, np.inf)]
         )

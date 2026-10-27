@@ -121,6 +121,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     percentile of the biomarker's observed training values (floored at 0);
     initial ``s`` is raised to the bound. ``None`` (default) keeps the lower
     bound at 0. The bound is stored as ``s_lower_`` after ``fit``.
+    ``s_lower_value`` (a scalar) takes precedence over ``s_lower_percentile``
+    when both are set. ``s_upper`` (scalar or per-biomarker array, default
+    None = inf) caps free ``s`` from above.
 
     ``backend="jax"`` replaces the globals, E-step, cluster-f and beta steps
     with JAX versions (RK4 forward solve on ``t_span``, exact reverse-mode
@@ -211,6 +214,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         transform_pad_rows: int = None,
         transform_pad_patients: int = None,
         s_lower_percentile: float = None,
+        s_lower_value: float = None,
+        s_upper=None,
         fit_intercept: bool = False,
         initial_c: np.ndarray = None,
         c_bounds=None,
@@ -274,6 +279,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.transform_pad_rows = transform_pad_rows
         self.transform_pad_patients = transform_pad_patients
         self.s_lower_percentile = s_lower_percentile
+        self.s_lower_value = s_lower_value
+        self.s_upper = s_upper
         # Per-biomarker intercept: prediction = c + s * x (JAX backend only).
         self.fit_intercept = fit_intercept
         self.initial_c = initial_c
@@ -1062,7 +1069,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             np.nanvar(X_obs_raw, axis=0, ddof=1), 1e-12
         )
         s_lower = None
-        if self.s_lower_percentile is not None:
+        if self.s_lower_value is not None:
+            s_lower = np.full(n_biomarkers, float(self.s_lower_value))
+        elif self.s_lower_percentile is not None:
             s_lower = np.maximum(
                 np.nanpercentile(X_obs_raw, float(self.s_lower_percentile), axis=0), 0.0
             )
@@ -1151,6 +1160,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         s_mask_bool = resolve_s_mask(n_biomarkers, self.fit_s, self.s_mask)
         if flat["s_lower"] is not None:
             s = np.maximum(s, flat["s_lower"])
+        if self.s_upper is not None:
+            s_up = np.asarray(self.s_upper, dtype=float).ravel()
+            if s_up.size == 1:
+                s_up = np.full(n_biomarkers, float(s_up[0]))
+            s = np.minimum(s, s_up)
         s[~s_mask_bool] = 1.0
         self.s_mask_ = s_mask_bool
         self.s_lower_ = None if flat["s_lower"] is None else flat["s_lower"].copy()
@@ -1270,6 +1284,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         subtype_counts_hist = np.zeros((self.n_subtypes, T), dtype=int)
         beta_at_upper_hist = np.zeros(T, dtype=float)
         estep_moves_hist = np.zeros(T, dtype=int)
+        f_step_nit_hist = np.full(T, -1, dtype=int)
+        f_step_message_hist = np.empty(T, dtype=object)
+        f_step_message_hist[:] = ""
         subtype_counts_hist[:, 0] = np.bincount(assignments, minlength=self.n_subtypes)
         beta_at_upper_hist[0] = np.mean(beta >= beta_upper - _AT_UPPER_TOL)
 
@@ -1299,6 +1316,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             subtype_counts_hist=subtype_counts_hist,
             beta_at_upper_hist=beta_at_upper_hist,
             estep_moves_hist=estep_moves_hist,
+            f_step_nit_hist=f_step_nit_hist,
+            f_step_message_hist=f_step_message_hist,
+            f_step_nit=-1,
+            f_step_message="",
             estep_beta_moves=0,
             beta_upper=beta_upper,
             best_lse=np.inf,
@@ -1440,6 +1461,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 fit_s=self.fit_s,
                 s_mask=self.s_mask_,
                 s_lower=flat["s_lower"],
+                s_upper=self.s_upper,
                 assignments=state["assignments"],
                 cluster_f=state["cluster_f"],
                 strict_tol=self.strict_tol,
@@ -1665,6 +1687,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             fit_s=self.fit_s,
             s_mask=self.s_mask_,
             s_lower=flat["s_lower"],
+            s_upper=self.s_upper,
             assignments=state["assignments"],
             cluster_f=state["cluster_f"],
             strict_tol=self.strict_tol,
@@ -1742,6 +1765,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 if not np.any(state["assignments"] == z):
                     print(f"Warning: Cluster {z} is empty at iteration {loop_iter}")
 
+        f_info = {}
         state["cluster_f"] = fit_theta_cluster_all_jax(
             X_obs,
             dt,
@@ -1758,7 +1782,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             strict_tol=self.strict_tol,
             obs_weight=flat["obs_weight"],
             packed=packed,
+            info=f_info,
         )
+        state["f_step_nit"] = int(f_info.get("nit", -1))
+        state["f_step_message"] = str(f_info.get("message", ""))
 
         # Solve once at the new cluster_f; the beta step reuses these trajectories.
         beta_trajectories = solve_trajectories_jax(
@@ -1841,6 +1868,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             obs_weight=flat["obs_weight"],
             s_mask=self.s_mask_,
             s_lower=flat["s_lower"],
+            s_upper=self.s_upper,
             packed=(raw_data, meta),
         )
         c = state["current_c"]
@@ -1869,6 +1897,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.subtype_counts_history_ = state["subtype_counts_hist"][:, :_h]
         self.beta_at_upper_fraction_history_ = state["beta_at_upper_hist"][:_h]
         self.estep_beta_moves_history_ = state["estep_moves_hist"][:_h]
+        self.f_step_nit_ = np.asarray(state["f_step_nit_hist"][:_h], dtype=int)
+        self.f_step_message_ = np.asarray(state["f_step_message_hist"][:_h], dtype=object)
 
         self.cluster_f = state["cluster_f"]
         self.final_scalar_K = state["current_scalar_K"]
@@ -1958,6 +1988,104 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.n_obs_,
             k,
         )
+
+    def polish_cluster_f(self, X: list) -> dict:
+        """One extra cluster-f step with beta, assignments, kappa, s_t, s and c held.
+
+        Uses the same ``lambda_f`` and the same shifted observations the last
+        f-step used. Updates ``cluster_f`` and recomputes BIC / per-biomarker SSE.
+        """
+        from .optimizer_jax import fit_theta_cluster_all_jax
+        from . import jax_core as jc
+
+        if not hasattr(self, "cluster_f"):
+            raise RuntimeError("fit() must be called before polish_cluster_f()")
+        flat = self._prepare_data(X)
+        n_patients = flat["n_patients"]
+        packed, meta = jc.pack_data(
+            flat["X_obs"],
+            flat["obs_weight"],
+            flat["dt"],
+            flat["ids"],
+            flat["cog"],
+            n_patients,
+            pad_rows=self.jax_pad_rows,
+            pad_patients=self.jax_pad_patients,
+        )
+        c = self._final_c_or_zero(flat["n_biomarkers"])
+        if self.fit_intercept and getattr(self, "final_c", None) is not None:
+            packed = jc.shift_data(packed, jc.f64(np.asarray(self.final_c, dtype=float)))
+            X_obs = flat["X_obs"] - np.asarray(self.final_c, dtype=float)[None, :]
+        else:
+            X_obs = flat["X_obs"]
+        beta = np.asarray(self.beta_history, dtype=float)[:, -1]
+        assignments = np.asarray(self.final_assignments, dtype=int)
+        F_pre = np.stack([np.ravel(f) for f in self.cluster_f]).astype(float)
+        info: dict = {}
+        new_f = fit_theta_cluster_all_jax(
+            X_obs,
+            flat["dt"],
+            flat["ids"],
+            self.K,
+            self.t_span,
+            cluster_f=self.cluster_f,
+            assignments=assignments,
+            s=np.asarray(self.final_s, dtype=float),
+            scalar_K=float(self.final_scalar_K),
+            lambda_f=float(self.lambda_f),
+            beta_pred=beta,
+            kappa=np.asarray(self.final_kappa, dtype=float),
+            strict_tol=self.strict_tol,
+            obs_weight=flat["obs_weight"],
+            packed=(packed, meta),
+            info=info,
+        )
+        F_post = np.stack([np.ravel(f) for f in new_f]).astype(float)
+        self.cluster_f = new_f
+        self.final_f = np.ravel(new_f[0]).copy()
+        self._sse_per_biomarker = compute_sse_per_biomarker(
+            flat["X_obs"] - c[None, :],
+            flat["dt"],
+            flat["ids"],
+            beta,
+            assignments,
+            new_f,
+            self.final_s,
+            self.final_scalar_K,
+            self.final_kappa,
+            self.K,
+            self.t_span,
+            ode_method=self.ode_method,
+            obs_weight=flat["obs_weight"],
+        )
+        k = count_bic_params(
+            self.final_s,
+            self.final_kappa,
+            self.cluster_f,
+            self.n_subtypes,
+            self.lambda_cog,
+            self.cluster_cog_a,
+            fit_s=self.fit_s,
+            s_mask=getattr(self, "s_mask_", self.s_mask),
+        )
+        k += self._n_free_c(flat["n_biomarkers"])
+        self.bic_n_params_ = k
+        self.bic_ = compute_bic(
+            self._sse_per_biomarker,
+            self._var_per_biomarker_null,
+            self.n_obs_,
+            k,
+        )
+        self.lse_final = float(np.nansum(self._sse_per_biomarker))
+        n_exact_zero = int(np.sum(F_post == 0.0))
+        n_zeroed = int(np.sum((F_pre > 0.0) & (F_post == 0.0)))
+        self.f_polish_info_ = dict(
+            nit=info.get("nit"),
+            message=info.get("message"),
+            n_f_exactly_zero=n_exact_zero,
+            n_f_zeroed=n_zeroed,
+        )
+        return dict(F_pre=F_pre, F_post=F_post, info=info, n_f_exactly_zero=n_exact_zero, n_f_zeroed=n_zeroed)
 
     def _n_free_c(self, n_biomarkers: int) -> int:
         """Number of free intercept entries counted in BIC."""
@@ -2119,6 +2247,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             state["current_beta"] >= state["beta_upper"] - _AT_UPPER_TOL
         )
         state["estep_moves_hist"][hist_idx] = state["estep_beta_moves"]
+        state["f_step_nit_hist"][hist_idx] = int(state.get("f_step_nit", -1))
+        state["f_step_message_hist"][hist_idx] = str(state.get("f_step_message", ""))
         for z in range(self.n_subtypes):
             state["cog_reg_hist"][z, :, hist_idx] = np.concatenate(
                 [state["cluster_cog_a"][z], [state["cluster_cog_b"][z]]]
