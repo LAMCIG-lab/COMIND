@@ -39,6 +39,7 @@ from .assignments import (
     update_assignments_joint_grid,
     update_assignments_jitter,
 )
+from .cvic import silverman_bandwidth, subject_logliks_cvic, subtype_trajs_and_dxdt
 from .model_selection import (
     compute_sse_per_biomarker,
     count_bic_params,
@@ -160,6 +161,14 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     ``beta_at_upper_fraction_history_`` (fraction of patients with
     ``beta_i >= beta_upper_i - 1e-3``) and ``estep_beta_moves_history_``
     (patients whose beta the E-step moved; always 0 in ``"current"`` mode).
+
+    After ``fit``, training empirical quantities used by integral CVIC are
+    stored as ``sigma_sq_`` / ``sigma_`` (per-biomarker residual variance),
+    ``subtype_prior_`` (hard-assignment frequencies), ``beta_train_`` (fitted
+    time-shifts), ``beta_var_``, and ``beta_kde_bandwidth_`` (Silverman).
+    ``subject_loglik_cvic`` / ``score_cvic`` score held-out subjects by
+    Gauss–Hermite marginalization of β and a log-sum-exp over subtypes;
+    they do not refit β or z on the test subject.
     """
 
     def __init__(
@@ -1958,6 +1967,72 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.n_obs_,
             k,
         )
+        self._store_cvic_empirical(state, flat)
+
+    def _store_cvic_empirical(self, state, flat):
+        """Residual σ̂, subtype frequencies, and training β's for held-out CVIC."""
+        n_obs_b = np.asarray(flat["obs_weight"], dtype=np.float64).sum(axis=0)
+        sse = np.asarray(self._sse_per_biomarker, dtype=np.float64)
+        self.sigma_sq_ = np.maximum(sse / np.maximum(n_obs_b, 1.0), 1e-12)
+        self.sigma_ = np.sqrt(self.sigma_sq_)
+        counts = np.bincount(
+            np.asarray(state["assignments"], dtype=int),
+            minlength=self.n_subtypes,
+        ).astype(np.float64)
+        total = float(counts.sum())
+        self.subtype_prior_ = counts / total if total > 0 else np.full(self.n_subtypes, np.nan)
+        self.log_subtype_prior_ = np.full(self.n_subtypes, -np.inf, dtype=np.float64)
+        pos = self.subtype_prior_ > 0
+        self.log_subtype_prior_[pos] = np.log(self.subtype_prior_[pos])
+        self.beta_train_ = np.asarray(state["current_beta"], dtype=np.float64).copy()
+        self.beta_var_ = float(max(np.var(self.beta_train_), 1e-8))
+        self.beta_kde_bandwidth_ = silverman_bandwidth(self.beta_train_)
+        self._cvic_trajs_, self._cvic_dxdts_ = subtype_trajs_and_dxdt(
+            self.cluster_f, self.K, self.t_span, self.final_scalar_K,
+            self.final_kappa, ode_method=self.ode_method,
+        )
+
+    def subject_loglik_cvic(self, X: list, n_gh: int = 15) -> np.ndarray:
+        """
+        Predictive log density of each subject in ``X``, β and z marginalized.
+
+        Uses the training residual σ̂, empirical subtype prior, and KDE of
+        training time-shifts stored by ``fit``. Does not mutate ``X``. A
+        subject with no observed entries scores 0.
+
+        Returns
+        -------
+        ndarray, shape (len(X),)
+        """
+        if not hasattr(self, "sigma_sq_") or not hasattr(self, "cluster_f"):
+            raise RuntimeError("fit() must be called before subject_loglik_cvic()")
+        return subject_logliks_cvic(
+            X,
+            cluster_f=self.cluster_f,
+            s=self.final_s,
+            c=self._final_c_or_zero(np.ravel(self.final_s).shape[0]),
+            scalar_K=self.final_scalar_K,
+            kappa=self.final_kappa,
+            K=self.K,
+            t_span=self.t_span,
+            sigma=self.sigma_,
+            log_pi=self.log_subtype_prior_,
+            beta_train=self.beta_train_,
+            kde_bandwidth=self.beta_kde_bandwidth_,
+            beta_var=self.beta_var_,
+            t_max=self.t_max,
+            n_beta_grid=self.n_beta_grid,
+            ode_method=self.ode_method,
+            n_gh=n_gh,
+            cap_beta_by_followup=self.cap_beta_by_followup,
+            verbose=self.verbose,
+            trajs=getattr(self, "_cvic_trajs_", None),
+            dxdts=getattr(self, "_cvic_dxdts_", None),
+        )
+
+    def score_cvic(self, X: list, n_gh: int = 15) -> float:
+        """``-2 * sum of subject_loglik_cvic(X)``. Lower is better."""
+        return float(-2.0 * np.sum(self.subject_loglik_cvic(X, n_gh=n_gh)))
 
     def _n_free_c(self, n_biomarkers: int) -> int:
         """Number of free intercept entries counted in BIC."""
@@ -2082,6 +2157,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             subtype_counts_history=np.copy(state["subtype_counts_hist"][:, :_h]),
             beta_at_upper_fraction_history=np.copy(state["beta_at_upper_hist"][:_h]),
             estep_beta_moves_history=np.copy(state["estep_moves_hist"][:_h]),
+            sigma_sq=np.copy(getattr(self, "sigma_sq_", np.array([]))),
+            subtype_prior=np.copy(getattr(self, "subtype_prior_", np.array([]))),
+            beta_train=np.copy(state["current_beta"]),
+            beta_kde_bandwidth=float(getattr(self, "beta_kde_bandwidth_", np.nan)),
         )
 
         # np.savez appends ".npz"; use a .tmp stem so the temp file is <path>.tmp.npz
