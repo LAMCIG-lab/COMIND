@@ -77,6 +77,68 @@ def _lse_improvement_acceptable(best, lse_val, eps, rel_tol):
     return delta / max(abs(best), 1e-12) >= rel_tol
 
 
+def em_relative_stop(prev_loss, loss, n_small, n_completed, stop_rel_tol,
+                     stop_patience, min_iter):
+    """After an accepted step, decide whether the relative gain has flattened.
+
+    ``prev_loss`` is the loss the loop just compared against (``best_lse``
+    before this step). The first accepted step has a non-finite previous
+    loss and does not count. ``stop_rel_tol is None`` never stops, which is
+    the historical loop: run until ``max_iter`` or a step that does not
+    improve at all.
+
+    Returns ``(stop, n_small)``.
+    """
+    if stop_rel_tol is None or not np.isfinite(prev_loss):
+        return False, 0
+    rel = (float(prev_loss) - float(loss)) / max(abs(float(loss)), 1e-12)
+    n_small = int(n_small) + 1 if rel < float(stop_rel_tol) else 0
+    stop = int(n_completed) >= int(min_iter) and n_small >= int(stop_patience)
+    return bool(stop), int(n_small)
+
+
+def replay_lse_stop(lse_history, stop_rel_tol=None, stop_patience=3, min_iter=15,
+                    max_iter=None):
+    """Walk a saved ``lse_history`` (index 0 = initial loss) with the EM stop.
+
+    Returns ``n_iter`` (accepted steps), ``stop_reason`` and the loss at the
+    stop. ``stop_rel_tol=None`` accepts every strictly improving step until
+    ``max_iter`` or the end of the history, matching the loop before this
+    stop existed.
+    """
+    h = np.asarray(lse_history, dtype=float).ravel()
+    if h.size == 0:
+        return {"n_iter": 0, "stop_reason": "max_iter", "loss": float("nan")}
+    best = np.inf
+    n_small = 0
+    n_completed = 0
+    reason = None
+    for t in range(1, h.size):
+        loss = float(h[t])
+        if np.isfinite(best) and loss >= best:
+            reason = "no_improvement"
+            break
+        prev = best
+        n_completed = t
+        best = loss if not np.isfinite(best) else min(best, loss)
+        stop, n_small = em_relative_stop(
+            prev, loss, n_small, n_completed, stop_rel_tol, stop_patience, min_iter,
+        )
+        if stop:
+            reason = "converged"
+            break
+        if max_iter is not None and n_completed >= int(max_iter):
+            reason = "max_iter"
+            break
+    if reason is None:
+        reason = "end"
+    return {
+        "n_iter": int(n_completed),
+        "stop_reason": reason,
+        "loss": float(h[min(n_completed, h.size - 1)]),
+    }
+
+
 class SubtypingEM(BaseEstimator, TransformerMixin):
     """
     EM algorithm for recovering disease progression model parameters
@@ -106,7 +168,15 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
     If, after exhausting all stages, LSE still does not strictly improve vs
     ``best_lse``, EM exits early and restores the checkpoint from that outer
-    iteration.
+    iteration (``stop_reason_="no_improvement"``).
+
+    ``stop_rel_tol`` (default ``None``) is a stop on the same accepted-step
+    loss. After ``min_iter`` accepted steps, if
+    ``(prev - loss) / max(|loss|, 1e-12)`` stays below ``stop_rel_tol`` for
+    ``stop_patience`` steps in a row, the loop stops with
+    ``stop_reason_="converged"``. ``None`` keeps the historical loop.
+    Reaching ``max_iter`` sets ``stop_reason_="max_iter"``. ``n_iter_`` is
+    the number of accepted steps.
 
     Warm-start: pass ``initial_f``, ``initial_s``, ``initial_scalar_K``,
     ``initial_kappa``, ``initial_assignments``, per-subtype cognitive params,
@@ -192,6 +262,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         theta_solver_stages=None,
         epsilon: float = 1e-2,
         relative_tolerance: float = 1e-3,
+        stop_rel_tol: float = None,
+        stop_patience: int = 3,
+        min_iter: int = 15,
         n_subtypes: int = 2,
         assignments_jitter: bool = False,
         jitter_iter: int = 1,
@@ -255,6 +328,17 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
         self.epsilon = epsilon
         self.relative_tolerance = relative_tolerance
+        if stop_rel_tol is not None and not (float(stop_rel_tol) > 0):
+            raise ValueError("stop_rel_tol must be positive or None")
+        if int(stop_patience) < 1:
+            raise ValueError("stop_patience must be >= 1")
+        if int(min_iter) < 1:
+            raise ValueError("min_iter must be >= 1")
+        self.stop_rel_tol = None if stop_rel_tol is None else float(stop_rel_tol)
+        self.stop_patience = int(stop_patience)
+        self.min_iter = int(min_iter)
+        self.n_iter_ = 0
+        self.stop_reason_ = None
 
         self.n_subtypes = n_subtypes
         self.assignments_jitter = assignments_jitter
@@ -1342,6 +1426,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
             pbar = _NoPbar()
 
+        state["n_small"] = 0
+        state["stop_reason"] = None
         while state["loop_iter"] < self.max_iter:
             iter_start = time.perf_counter()
             hist_idx = state["loop_iter"] + 1
@@ -1386,6 +1472,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                     )
                 self._restore_checkpoint(state, ck)
                 state["final_lse"] = float(state["best_lse"])
+                state["stop_reason"] = "no_improvement"
                 break
 
             state["iter_time_hist"][hist_idx] = time.perf_counter() - iter_start
@@ -1394,6 +1481,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 np.sum(state["assignments"] != ck["assignments"])
             )
 
+            prev_best = state["best_lse"]
             self._record_history(state, lse, hist_idx)
             state["best_lse"] = (
                 lse
@@ -1402,6 +1490,13 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             )
             state["final_lse"] = lse
             state["loop_iter"] += 1
+            stop, state["n_small"] = em_relative_stop(
+                prev_best, lse, state["n_small"], state["loop_iter"],
+                self.stop_rel_tol, self.stop_patience, self.min_iter,
+            )
+            if stop:
+                state["stop_reason"] = "converged"
+                break
             pbar.update(1)
             if self.n_anneal_iters > 0 and state["loop_iter"] <= self.n_anneal_iters:
                 decay = self.anneal_decay ** (state["loop_iter"] - 1)
@@ -1420,6 +1515,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                         state["cluster_f"][z] * f_scale, 0.0
                     )
             self._save_fit_checkpoint(state, flat, X, fit_complete=False)
+
+        if state.get("stop_reason") is None:
+            state["stop_reason"] = "max_iter"
+        self.n_iter_ = int(state["loop_iter"])
+        self.stop_reason_ = state["stop_reason"]
 
     def _em_step(self, state, flat, current_solver):
         """One EM iteration (global θ, E-step, cog regression, cluster f, beta)."""
