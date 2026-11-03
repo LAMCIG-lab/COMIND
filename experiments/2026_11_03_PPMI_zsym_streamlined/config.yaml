@@ -1,0 +1,31 @@
+# PPMI (PD), z-score input, scale vs zsym and clinical reweighting (S0-S3).
+# Same setup as 2026_11_02_PPMI_lse_rescale_reweighting, on the shared runner.
+#   python scripts/run_experiment.py <this file> --arm S1 --smoke
+#   python scripts/submit_arms.py <this file> --n-subtypes 3 4 5 --workers 16
+dataset: ppmi
+data_csv: $COMIND_DATA/PPMI_deviation_scores.csv
+connectome: $COMIND_DATA/iit_connectivity_matrix/connectome_experiment_10_19_2026/K_82_log_knn8_row.csv
+n_subtypes: 4
+estimator:
+  max_iter: 80
+  min_iter: 25
+  stop_rel_tol: 1.0e-4
+  stop_patience: 5
+  fit_s: true
+  s_lower_value: 1.0
+  s_upper: 3.0
+  init_scalar_k_cap: 0.02
+  obs_model: scale
+n_init: 3
+objective: cv_lse
+cv_folds: 3
+cvic: true
+polish_f: true
+n_trials: 200
+n_startup_trials: 20
+worker_hours: 71.5
+arms:
+  S0: {estimator: {obs_model: scale}}
+  S1: {estimator: {obs_model: zsym}}
+  S2: {estimator: {obs_model: zsym}, clinical_weight_share: 0.25}
+  S3: {estimator: {obs_model: zsym}, clinical_weight_share: 0.5}

@@ -19,7 +19,6 @@ venv/
 env/
 
 # Data
-experiments/
 notebooks/PPMI_with_beta_subtype_split.csv
 notebooks/ppmi_filter.ipynb
 *.csv
@@ -30,3 +29,11 @@ experiment_pipeline/**/results/
 experiment_pipeline/**/logs/
 experiment_pipeline/pd_all/
 *.md
+
+# Experiments: only each folder's config.yaml and NOTES.md are tracked. Results,
+# journals, logs and notebooks hold subject-level data (DUA) and never are.
+/experiments/*
+!/experiments/*/
+/experiments/*/*
+!/experiments/*/config.yaml
+!/experiments/*/NOTES.md
