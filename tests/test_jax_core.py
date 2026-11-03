@@ -667,6 +667,15 @@ def test_no_recompiles():
             lambda_jsd=0.1, lambda_f=0.01, lambda_kappa=0.5,
             initial_assignments=rng.integers(0, 2, len(X)),
         ).fit(X)
+        # zsym adds only _globals_zsym_vg; it reuses _shift_data_jit and the
+        # shared step jits on the same padded shape, with or without weights.
+        for w in (None, np.linspace(0.5, 2.0, B)):
+            SubtypingEM(
+                **common, obs_model="zsym", s_lower_value=1.0, s_upper=3.0,
+                biomarker_weights=w, jax_pad_rows=R, jax_pad_patients=P,
+                lambda_jsd=0.1, lambda_f=0.01, lambda_kappa=0.5,
+                initial_assignments=rng.integers(0, 2, len(X)),
+            ).fit(X)
 
         def cache_sizes():
             return {name: fn._cache_size() for name, fn in jc.JITTED_FUNCTIONS.items()}

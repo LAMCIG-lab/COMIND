@@ -62,6 +62,8 @@ from .utils import (
 
 _BACKENDS = {"numpy", "jax"}
 _ESTEP_MODES = {"current", "joint_grid"}
+_OBS_MODELS = ("scale", "zsym")
+_ZSYM_S0 = 2.0  # zsym start: middle of the agreed s bounds [1, 3]
 _AT_UPPER_TOL = 1e-3
 
 
@@ -228,6 +230,20 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     ``transform_pad_rows`` / ``transform_pad_patients`` to every CV fold to
     share one compiled shape.
 
+    ``obs_model="zsym"`` (JAX only, ``fit_intercept=False``) is the symmetric
+    clipping model for z-scored inputs: ``s`` is the clipping level and the
+    prediction is ``s * (2 x - 1)`` on [-s, s]. It runs on the intercept path
+    with ``final_s = 2 s`` and ``final_c = -s`` tied to s; the fitted s itself
+    is ``final_s_clip``. Bounds ``s_lower_value`` / ``s_upper`` apply to s,
+    ``initial_s`` is s (default 2), and ``lambda_c`` is not used. The default
+    ``"scale"`` is the plain ``s * x`` model.
+
+    ``biomarker_weights`` (JAX only, shape (B,), default None = ones) weights
+    biomarker b's squared residuals by ``w_b`` in every fitting step and in
+    ``transform``, by multiplying the observation mask by ``sqrt(w_b)``. BIC
+    and ``_sse_per_biomarker`` stay unweighted. ``score(weighted=True)`` uses
+    the weights; ``score_blocks`` reports unweighted per-group MSE.
+
     Diagnostics recorded every iteration (index 0 = initial state):
     ``subtype_counts_history_`` (n_subtypes, n_iter + 1),
     ``beta_at_upper_fraction_history_`` (fraction of patients with
@@ -295,6 +311,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         c_mask: np.ndarray = None,
         lambda_c: float = 0.0,
         c_center: np.ndarray = None,
+        obs_model: str = "scale",
+        biomarker_weights: np.ndarray = None,
     ):
         self.max_iter = max_iter
         self.t_max = t_max
@@ -372,6 +390,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.c_mask = c_mask
         self.lambda_c = lambda_c
         self.c_center = c_center
+        # "scale": prediction s * x. "zsym": prediction s * (2 x - 1) with s the
+        # clipping level (intercept path with scale 2 s and c = -s tied to s).
+        self.obs_model = obs_model
+        # Per-biomarker loss weights w_b (None = all ones). sqrt(w_b) multiplies
+        # the observation mask, so every squared residual is weighted by w_b.
+        self.biomarker_weights = biomarker_weights
         self._validate_backend()
 
     def _validate_backend(self):
@@ -381,6 +405,18 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             )
         if getattr(self, "fit_intercept", False) and self.backend != "jax":
             raise ValueError("fit_intercept=True requires backend='jax'")
+        obs_model = getattr(self, "obs_model", "scale")
+        if obs_model not in _OBS_MODELS:
+            raise ValueError(f"obs_model must be one of {_OBS_MODELS}, got {obs_model!r}")
+        if obs_model == "zsym":
+            if self.backend != "jax":
+                raise ValueError("obs_model='zsym' requires backend='jax'")
+            if getattr(self, "fit_intercept", False):
+                raise ValueError(
+                    "obs_model='zsym' requires fit_intercept=False (c is tied to -s)"
+                )
+        if getattr(self, "biomarker_weights", None) is not None and self.backend != "jax":
+            raise ValueError("biomarker_weights requires backend='jax'")
         if self.estep_mode not in _ESTEP_MODES:
             raise ValueError(
                 f"estep_mode must be one of {sorted(_ESTEP_MODES)}, got {self.estep_mode!r}"
@@ -416,9 +452,38 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         c = getattr(self, "final_c", None)
         return np.zeros(n_biomarkers) if c is None else np.asarray(c, dtype=float)
 
+    def _is_zsym(self) -> bool:
+        return getattr(self, "obs_model", "scale") == "zsym"
+
+    def _uses_shift(self) -> bool:
+        """True when predictions are ``c + s * x`` (free intercept or zsym)."""
+        return bool(self.fit_intercept) or self._is_zsym()
+
+    def _sqrt_weights(self, n_biomarkers: int):
+        """``sqrt(biomarker_weights)`` as (B,), or None when unweighted."""
+        w = getattr(self, "biomarker_weights", None)
+        if w is None:
+            return None
+        w = np.asarray(w, dtype=float).ravel()
+        if w.shape != (n_biomarkers,):
+            raise ValueError(
+                f"biomarker_weights must have shape ({n_biomarkers},), got {w.shape}"
+            )
+        if not np.all(np.isfinite(w)) or np.any(w < 0):
+            raise ValueError("biomarker_weights must be finite and >= 0")
+        return np.sqrt(w)
+
+    def _split_weighted(self, X_obs):
+        """``split_observed`` with the mask multiplied by ``sqrt(w_b)``."""
+        X_filled, obs_weight = split_observed(X_obs)
+        sw = self._sqrt_weights(X_filled.shape[1])
+        if sw is not None:
+            obs_weight = obs_weight * sw[None, :]
+        return X_filled, obs_weight
+
     def _shift_patients(self, X: list) -> list:
         """Copies of the patient dicts with ``X_obs - final_c`` (no-op without an intercept)."""
-        if not self.fit_intercept or getattr(self, "final_c", None) is None:
+        if not self._uses_shift() or getattr(self, "final_c", None) is None:
             return X
         c = np.asarray(self.final_c, dtype=float)
         return [{**p, "X_obs": np.asarray(p["X_obs"], dtype=float) - c[None, :]} for p in X]
@@ -530,7 +595,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         caps = self._transform_beta_caps(X, beta_grid)
 
         for idx, p in enumerate(tqdm(X, desc="Estimating beta and subtype assignments")):
-            X_obs_i, obs_weight_i = split_observed(p["X_obs"])
+            X_obs_i, obs_weight_i = self._split_weighted(p["X_obs"])
             dt_i = p["dt"]
             cog_i = p["cog"]
             if cog_i.ndim == 1:
@@ -731,7 +796,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         for idx, p in enumerate(
             tqdm(X, desc="Estimating per-subtype beta and probabilities")
         ):
-            X_obs_i, obs_weight_i = split_observed(p["X_obs"])
+            X_obs_i, obs_weight_i = self._split_weighted(p["X_obs"])
             dt_i = np.asarray(p["dt"], dtype=float).reshape(-1)
             cog_i = p["cog"]
             if cog_i.ndim == 1:
@@ -883,9 +948,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         dt = np.concatenate(dts)
         ids = np.concatenate([np.full(len(d), i) for i, d in enumerate(dts)])
         cog = np.vstack([ensure_2d_cog(p["cog"], len(d)) for p, d in zip(X, dts)])
-        X_obs, obs_weight = split_observed(X_raw)
+        X_obs, obs_weight = self._split_weighted(X_raw)
         data, meta = jc.pack_data(
-            X_raw, None, dt, ids, cog, n_patients,
+            X_raw, None if self._sqrt_weights(X_raw.shape[1]) is None else obs_weight,
+            dt, ids, cog, n_patients,
             pad_rows=getattr(self, "transform_pad_rows", None),
             pad_patients=getattr(self, "transform_pad_patients", None),
         )
@@ -1079,7 +1145,9 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         check_beta_grid_within_cap(beta_grid, caps)
         return caps
 
-    def score(self, X: list, y=None, per_value: bool = True) -> float:
+    def score(
+        self, X: list, y=None, per_value: bool = True, weighted: bool = True
+    ) -> float:
         """Negative held-out reconstruction error on X (higher = better).
 
         This is the number scikit-learn's ``cross_val_score`` / ``cross_validate``
@@ -1091,14 +1159,70 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             different sizes or amounts of missing data are comparable.
         per_value=False: minus the total sum of squared residuals (the old
             behaviour).
+        weighted=True (default): each squared residual is multiplied by its
+            biomarker's ``biomarker_weights`` entry, as in the fit. The
+            per-value denominator stays the number of observed cells. No-op
+            without weights.
         """
         X = self._shift_patients(X)
         transformed = self.transform(X, _shifted=True)
-        sse = self._compute_val_score(X, transformed["beta"], transformed["subtype"])
+        sse = self._compute_val_score(
+            X, transformed["beta"], transformed["subtype"], weighted=weighted
+        )
         if not per_value:
             return -sse
         n_obs = int(sum(np.isfinite(np.asarray(p["X_obs"], dtype=float)).sum() for p in X))
         return -sse / max(n_obs, 1)
+
+    def sse_per_biomarker(self, X: list, transformed=None):
+        """Unweighted held-out SSE and observed-cell count per biomarker.
+
+        Places every patient with ``transform`` (weighted as in the fit) unless
+        ``transformed`` (the output of ``transform`` on the same ``X``) is given.
+
+        Returns
+        -------
+        sse : (B,) float
+        n_obs : (B,) int
+        """
+        X = self._shift_patients(X)
+        if transformed is None:
+            transformed = self.transform(X, _shifted=True)
+        beta = np.asarray(transformed["beta"], dtype=float)
+        assignments = np.asarray(transformed["subtype"], dtype=int)
+        X_preds = self._transform_trajectories_numpy()
+        s = np.asarray(self.final_s, dtype=float).ravel()
+        B = s.size
+        sse = np.zeros(B)
+        n_obs = np.zeros(B, dtype=int)
+        for i, p in enumerate(X):
+            X_obs_i, w_i = split_observed(p["X_obs"])
+            t = np.asarray(p["dt"], dtype=float) + float(beta[i])
+            pred = np.array(
+                [np.interp(t, self.t_span, s[b] * X_preds[int(assignments[i])][b]) for b in range(B)]
+            ).T
+            sse += np.sum(((X_obs_i - pred) * w_i) ** 2, axis=0)
+            n_obs += w_i.sum(axis=0).astype(int)
+        return sse, n_obs
+
+    def score_blocks(self, X: list, groups: dict, transformed=None) -> dict:
+        """Unweighted per-value MSE per biomarker group (positive, lower = better).
+
+        ``groups`` maps a name (e.g. ``"imaging"``, ``"clinical"``) to the
+        biomarker indices (or a boolean mask) in that group. A group with no
+        observed cells gets NaN. Weighting each block's MSE by its observed-cell
+        count recombines to ``-score(X, weighted=False)`` when the groups
+        partition the biomarkers.
+        """
+        sse, n_obs = self.sse_per_biomarker(X, transformed=transformed)
+        out = {}
+        for name, idx in groups.items():
+            idx = np.asarray(idx)
+            if idx.dtype == bool:
+                idx = np.flatnonzero(idx)
+            n = int(n_obs[idx].sum())
+            out[name] = float(sse[idx].sum() / n) if n > 0 else float("nan")
+        return out
 
     def compute_subtype_mapping(self, true_f_list, verbose=True):
         """Compute fitted→true subtype mapping by nearest-f matching."""
@@ -1159,11 +1283,15 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             s_lower = np.maximum(
                 np.nanpercentile(X_obs_raw, float(self.s_lower_percentile), axis=0), 0.0
             )
-        X_obs, obs_weight = split_observed(X_obs_raw)
-        n_obs = int(obs_weight.sum())
+        X_obs, obs_mask = split_observed(X_obs_raw)
+        n_obs = int(obs_mask.sum())
+        # obs_weight (sqrt of the biomarker weights times the 0/1 mask) enters
+        # every fitting step; obs_mask stays 0/1 for BIC and per-biomarker SSE.
+        sw = self._sqrt_weights(n_biomarkers)
+        obs_weight = obs_mask if sw is None else obs_mask * sw[None, :]
 
         for i in range(n_patients):
-            if obs_weight[ids == i].sum() == 0:
+            if obs_mask[ids == i].sum() == 0:
                 warnings.warn(
                     f"Patient index {i} has zero observed biomarker entries; "
                     f"beta is unidentified from reconstruction alone.",
@@ -1225,6 +1353,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             n_obs=n_obs,
             var_per_biomarker_null=var_per_biomarker_null,
             obs_weight=obs_weight,
+            obs_mask=obs_mask,
         )
 
     def _initialize_state(self, flat, X):
@@ -1238,6 +1367,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             s = np.asarray(self.initial_s, dtype=float).ravel().copy()
             if s.shape != (n_biomarkers,):
                 raise ValueError(f"initial_s must have shape ({n_biomarkers},), got {s.shape}")
+        elif self._is_zsym():
+            s = np.full(n_biomarkers, _ZSYM_S0)
         else:
             s = rng.uniform(0.1, 3, size=n_biomarkers)
 
@@ -1320,6 +1451,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         if self.fit_intercept:
             cb = self._resolve_c_bounds(n_biomarkers)
             c = np.clip(c, cb[:, 0], cb[:, 1])
+        s_clip = None
+        if self._is_zsym():
+            # s is the clipping level; the shared c + s * x path gets 2 s and -s.
+            s_clip = s.copy()
+            s = 2.0 * s_clip
+            c = -s_clip.copy()
         X_preds = precompute_trajectories(
             cluster_f, self.K, self.t_span, scalar_K, kappa,
             ode_method=self.ode_method,
@@ -1378,6 +1515,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             current_beta=beta.copy(),
             current_s=s,
             current_c=c,
+            current_s_clip=s_clip,
             c_hist=[c.copy()],
             current_kappa=kappa,
             current_scalar_K=scalar_K,
@@ -1759,6 +1897,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
         if self.fit_intercept:
             return self._em_step_jax_intercept(state, flat)
+        if self._is_zsym():
+            return self._em_step_jax_zsym(state, flat)
 
         # globals_trajectories is solved at the converged globals with this same
         # cluster_f, so the E-step below (hard, jittered or joint-grid) can reuse
@@ -1979,6 +2119,58 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         )
         return self._em_step_jax_after_globals(state, shifted_flat, globals_trajectories)
 
+    def _em_step_jax_zsym(self, state, flat):
+        """
+        One JAX EM iteration of ``obs_model="zsym"`` (prediction ``s * (2 x - 1)``).
+
+        The globals step fits (s, kappa, scalar_K) with ``s`` the clipping level
+        on the unshifted data. The state then holds ``current_s = 2 s`` and
+        ``current_c = -s``, and the rest of the iteration runs on ``X + s``
+        exactly as in the free-intercept path.
+        """
+        from . import jax_core as jc
+        from .optimizer_jax import fit_theta_globals_zsym_jax
+
+        raw_data, meta = flat["jax"]["packed_raw"]
+        (
+            s_clip,
+            state["current_kappa"],
+            state["current_scalar_K"],
+            globals_trajectories,
+        ) = fit_theta_globals_zsym_jax(
+            X_obs=flat["X_obs"],
+            dt_obs=flat["dt"],
+            ids=flat["ids"],
+            K=self.K,
+            t_span=self.t_span,
+            cluster_f=state["cluster_f"],
+            assignments=state["assignments"],
+            beta_pred=state["current_beta"],
+            s_guess=state["current_s_clip"],
+            scalar_K_guess=state["current_scalar_K"],
+            kappa_guess=state["current_kappa"],
+            lambda_scalar=self.lambda_scalar,
+            lambda_kappa=self.lambda_kappa,
+            scalar_K_center=self.scalar_K_center,
+            fit_s=self.fit_s,
+            strict_tol=self.strict_tol,
+            obs_weight=flat["obs_weight"],
+            s_mask=self.s_mask_,
+            s_lower=flat["s_lower"],
+            s_upper=self.s_upper,
+            packed=(raw_data, meta),
+        )
+        state["current_s_clip"] = s_clip
+        state["current_s"] = 2.0 * s_clip
+        state["current_c"] = -s_clip
+        c = state["current_c"]
+        shifted_flat = dict(flat)
+        shifted_flat["X_obs"] = flat["X_obs"] - c[None, :]
+        shifted_flat["jax"] = dict(
+            flat["jax"], packed=(jc._shift_data_jit(raw_data, jc.f64(c)), meta)
+        )
+        return self._em_step_jax_after_globals(state, shifted_flat, globals_trajectories)
+
     def _finalize_fit(self, state, flat, X):
         """Trim history arrays and copy fitted attributes onto self."""
         _h = state["loop_iter"] + 1
@@ -2004,6 +2196,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.final_scalar_K = state["current_scalar_K"]
         self.final_s = state["current_s"]
         self.final_c = np.copy(state["current_c"])
+        # zsym: the fitted clipping level s (final_s = 2 s, final_c = -s).
+        # None for obs_model="scale".
+        s_clip = state.get("current_s_clip")
+        self.final_s_clip = None if s_clip is None else np.copy(s_clip)
         self.c_history_ = np.array(state["c_hist"])
         self.final_kappa = state["current_kappa"]
         self.final_assignments = state["assignments"]
@@ -2068,7 +2264,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.K,
             self.t_span,
             ode_method=self.ode_method,
-            obs_weight=flat["obs_weight"],
+            obs_weight=flat["obs_mask"],
         )
         k = count_bic_params(
             self.final_s,
@@ -2113,7 +2309,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             pad_patients=self.jax_pad_patients,
         )
         c = self._final_c_or_zero(flat["n_biomarkers"])
-        if self.fit_intercept and getattr(self, "final_c", None) is not None:
+        if self._uses_shift() and getattr(self, "final_c", None) is not None:
             packed = jc.shift_data(packed, jc.f64(np.asarray(self.final_c, dtype=float)))
             X_obs = flat["X_obs"] - np.asarray(self.final_c, dtype=float)[None, :]
         else:
@@ -2156,7 +2352,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.K,
             self.t_span,
             ode_method=self.ode_method,
-            obs_weight=flat["obs_weight"],
+            obs_weight=flat["obs_mask"],
         )
         k = count_bic_params(
             self.final_s,
@@ -2176,7 +2372,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             self.n_obs_,
             k,
         )
-        self.lse_final = float(np.nansum(self._sse_per_biomarker))
+        sw = self._sqrt_weights(flat["n_biomarkers"])
+        if sw is None:
+            self.lse_final = float(np.nansum(self._sse_per_biomarker))
+        else:
+            self.lse_final = float(np.nansum(sw ** 2 * self._sse_per_biomarker))
         n_exact_zero = int(np.sum(F_post == 0.0))
         n_zeroed = int(np.sum((F_pre > 0.0) & (F_post == 0.0)))
         self.f_polish_info_ = dict(
@@ -2225,6 +2425,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         return dict(
             s=np.copy(state["current_s"]),
             c=np.copy(state["current_c"]),
+            s_clip=(
+                None if state.get("current_s_clip") is None
+                else np.copy(state["current_s_clip"])
+            ),
             kappa=np.asarray(state["current_kappa"], dtype=float).copy(),
             scalar_K=float(state["current_scalar_K"]),
             cluster_f=[np.ravel(fc).copy() for fc in state["cluster_f"]],
@@ -2238,6 +2442,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     def _restore_checkpoint(state, ck):
         state["current_s"] = np.copy(ck["s"])
         state["current_c"] = np.copy(ck["c"])
+        if ck.get("s_clip") is not None:
+            state["current_s_clip"] = np.copy(ck["s_clip"])
         state["current_kappa"] = np.copy(ck["kappa"])
         state["current_scalar_K"] = ck["scalar_K"]
         state["cluster_f"] = [fc.copy() for fc in ck["cluster_f"]]
@@ -2293,6 +2499,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             cluster_cog_b=np.array(state["cluster_cog_b"], dtype=float),
             final_s=np.copy(state["current_s"]),
             final_c=np.copy(state["current_c"]),
+            final_s_clip=(
+                np.zeros(0) if state.get("current_s_clip") is None
+                else np.copy(state["current_s_clip"])
+            ),
+            obs_model=str(getattr(self, "obs_model", "scale")),
             final_kappa=np.copy(state["current_kappa"]),
             final_scalar_K=float(state["current_scalar_K"]),
             beta_history=np.copy(state["beta_hist"][:, :_h]),
@@ -2354,11 +2565,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 [state["cluster_cog_a"][z], [state["cluster_cog_b"][z]]]
             )
 
-    def _compute_val_score(self, X, beta, assignments=None):
+    def _compute_val_score(self, X, beta, assignments=None, weighted: bool = False):
         """Reconstruction LSE on X. Each patient uses their assigned subtype trajectory.
 
         ``assignments`` indexes ``cluster_f``. If omitted, the assignments stored by
-        the most recent ``transform`` call are used.
+        the most recent ``transform`` call are used. ``weighted`` applies
+        ``biomarker_weights`` to each squared residual.
         """
         if assignments is None:
             assignments = getattr(self, "transform_assignments", None)
@@ -2390,7 +2602,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         lse = 0.0
         for i, p in enumerate(X):
             z = int(assignments[i])
-            X_obs_i, obs_weight_i = split_observed(p["X_obs"])
+            if weighted:
+                X_obs_i, obs_weight_i = self._split_weighted(p["X_obs"])
+            else:
+                X_obs_i, obs_weight_i = split_observed(p["X_obs"])
             lse += reconstruction_sse(
                 float(beta[i]),
                 X_obs_i,

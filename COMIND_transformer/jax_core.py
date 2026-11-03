@@ -684,6 +684,36 @@ def globals_loss_intercept(
     return loss + hyp.lambda_c * jnp.sum((c - c_center) ** 2)
 
 
+def globals_loss_zsym(
+    s: jnp.ndarray,
+    kappa: jnp.ndarray,
+    scalar_K: jnp.ndarray,
+    F: jnp.ndarray,
+    beta_full: jnp.ndarray,
+    assign_full: jnp.ndarray,
+    data: PackedData,
+    K: jnp.ndarray,
+    hyp: Hyp,
+    h: jnp.ndarray,
+    c_center: jnp.ndarray,
+    n_steps: int,
+    s_free: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    """
+    Globals loss of the symmetric clipping model ``obs_model="zsym"``.
+
+    ``s`` is the clipping level: the curve maps x in [0, 1] onto
+    ``z_hat = s * (2 x - 1)`` in [-s, s]. That is the intercept model with the
+    tied values ``scale = 2 s`` and ``c = -s``. ``data`` holds the unshifted
+    (raw z) observations. ``hyp.lambda_c`` must be 0; ``c_center`` is unused
+    then and only keeps the signature of ``globals_loss_intercept``.
+    """
+    return globals_loss_intercept(
+        2.0 * s, kappa, scalar_K, -s, F, beta_full, assign_full, data, K,
+        hyp, h, c_center, n_steps=n_steps, s_free=s_free,
+    )
+
+
 def cluster_loss(
     F: jnp.ndarray,
     s: jnp.ndarray,
@@ -1074,6 +1104,10 @@ _globals_c_vg = jax.jit(
     jax.value_and_grad(globals_loss_intercept, argnums=(0, 1, 2, 3)),
     static_argnames=("n_steps",),
 )
+_globals_zsym_vg = jax.jit(
+    jax.value_and_grad(globals_loss_zsym, argnums=(0, 1, 2)),
+    static_argnames=("n_steps",),
+)
 _shift_data_jit = jax.jit(shift_data)
 _cluster_vg = jax.jit(
     jax.value_and_grad(cluster_loss, argnums=0),
@@ -1093,6 +1127,7 @@ JITTED_FUNCTIONS = {
     "_traj_jit": _traj_jit,
     "_globals_vg": _globals_vg,
     "_globals_c_vg": _globals_c_vg,
+    "_globals_zsym_vg": _globals_zsym_vg,
     "_shift_data_jit": _shift_data_jit,
     "_cluster_vg": _cluster_vg,
     "_beta_vg": _beta_vg,

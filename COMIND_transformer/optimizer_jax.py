@@ -470,6 +470,117 @@ def fit_theta_globals_intercept_jax(
     return s_fit, kappa_fit, scalar_K_fit, c_fit, trajectories_to_numpy(traj)
 
 
+def fit_theta_globals_zsym_jax(
+    X_obs: np.ndarray,
+    dt_obs: np.ndarray,
+    ids: np.ndarray,
+    K: np.ndarray,
+    t_span: np.ndarray,
+    cluster_f: list,
+    assignments: np.ndarray,
+    beta_pred: np.ndarray,
+    s_guess: np.ndarray,
+    scalar_K_guess: float,
+    kappa_guess: np.ndarray,
+    lambda_scalar: float = 0.0,
+    lambda_kappa: float = 0.0,
+    scalar_K_center: float = SCALAR_K_CENTER,
+    fit_s: bool = True,
+    strict_tol: bool = False,
+    obs_weight: np.ndarray = None,
+    s_mask=None,
+    s_lower: np.ndarray = None,
+    s_upper=None,
+    *,
+    packed: Optional[tuple] = None,
+    info: Optional[dict] = None,
+) -> tuple:
+    """
+    Globals step of the symmetric clipping model (``jax_core.globals_loss_zsym``).
+
+    The L-BFGS-B parameters are (s, kappa, scalar_K), with ``s`` the clipping
+    level: the prediction is ``s * (2 x - 1)``, i.e. scale ``2 s`` and
+    intercept ``-s``. ``packed`` must hold the UNSHIFTED data. ``s`` bounds
+    come from ``s_lower`` / ``s_upper``; ``s_mask`` False entries are held at 1.
+    There is no intercept penalty.
+
+    Returns
+    -------
+    s_fit, kappa_fit, scalar_K_fit, trajectories
+        ``s_fit`` is the clipping level (not ``2 s``). ``trajectories`` as in
+        ``fit_theta_globals_jax``.
+    """
+    B = X_obs.shape[1]
+    n_patients = len(assignments)
+    data, meta = _get_packed(packed, X_obs, obs_weight, dt_obs, ids, None, n_patients)
+    P = meta["P"]
+    h, n_steps = _grid(t_span)
+
+    s_mask_bool = resolve_s_mask(B, fit_s, s_mask)
+    s_guess = np.asarray(s_guess, dtype=float).ravel().copy()
+    s_guess[~s_mask_bool] = 1.0
+    x0 = np.concatenate(
+        [s_guess, np.asarray(kappa_guess, dtype=float).ravel(), [float(scalar_K_guess)]]
+    )
+    bounds = (
+        [
+            tuple(b) if free else (1.0, 1.0)
+            for b, free in zip(_s_bounds(s_lower, B, s_upper).tolist(), s_mask_bool)
+        ]
+        + [(0.0, np.inf)] * B
+        + [(0.0, np.inf)]
+    )
+
+    F = jc.f64(_stack_f(cluster_f))
+    beta_full = jc.pad_beta(beta_pred, P)
+    assign_full = jc.pad_assignments(assignments, P)
+    K_j = jc.f64(K)
+    s_free = jc.f64(s_mask_bool.astype(float))
+    c_center_j = jc.f64(np.zeros(B))
+    hyp = jc.make_hyp(
+        lambda_scalar=lambda_scalar,
+        scalar_K_center=scalar_K_center,
+        lambda_kappa=lambda_kappa,
+    )
+    guard = _Guard("fit_theta_globals_zsym_jax")
+
+    def objective(params):
+        loss, (gs, gk, gK) = jc._globals_zsym_vg(
+            jc.f64(params[:B]),
+            jc.f64(params[B:2 * B]),
+            jc.f64(params[-1]),
+            F,
+            beta_full,
+            assign_full,
+            data,
+            K_j,
+            hyp,
+            h,
+            c_center_j,
+            n_steps=n_steps,
+            s_free=s_free,
+        )
+        grad = np.concatenate(
+            [np.asarray(gs), np.asarray(gk), np.atleast_1d(np.asarray(gK))]
+        ).astype(np.float64)
+        return guard.check(float(loss), grad)
+
+    result = minimize(
+        objective, x0=x0, method="L-BFGS-B", jac=True, bounds=bounds,
+        options=_lbfgs_options(strict_tol),
+    )
+    s_fit = np.asarray(result.x[:B], dtype=float).copy()
+    s_fit[~s_mask_bool] = 1.0
+    kappa_fit = np.asarray(result.x[B:2 * B], dtype=float).copy()
+    scalar_K_fit = float(result.x[-1])
+
+    traj = jc._traj_jit(F, jc.f64(kappa_fit), jc.f64(scalar_K_fit), K_j, h, n_steps=n_steps)
+    if info is not None:
+        info.update(nfev=result.nfev, nit=result.nit, message=str(result.message),
+                    nonfinite=guard.count)
+    return s_fit, kappa_fit, scalar_K_fit, trajectories_to_numpy(traj)
+
+
 def fit_theta_cluster_all_jax(
     X_obs: np.ndarray,
     dt_obs: np.ndarray,
