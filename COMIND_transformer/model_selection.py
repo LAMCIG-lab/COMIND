@@ -1,5 +1,7 @@
 # model_selection.py
 
+from typing import Tuple
+
 import numpy as np
 
 from .utils import solve_system
@@ -145,3 +147,41 @@ def compute_sse_per_biomarker(
             resid_r = resid_r * obs_weight[r]
         sse_per_b += resid_r ** 2
     return sse_per_b
+
+
+LOG_2PI = float(np.log(2.0 * np.pi))
+
+
+def gaussian_bic(
+    sse_per_biomarker,
+    n_obs_per_biomarker,
+    k_model,
+) -> Tuple[float, float]:
+    """Independent Gaussians, MLE variance per biomarker.
+
+    For biomarker b with n_b observed values and SSE_b,
+    σ²_b = SSE_b / n_b and
+
+        -2 log L_b = n_b * (log(2π) + log(σ²_b) + 1)
+
+    BIC = (-2 log L) + k_model * log(N), N = Σ n_b.
+
+    Returns
+    -------
+    bic_gauss, bic_gauss_neg2loglik
+    """
+    sse = np.asarray(sse_per_biomarker, dtype=float).ravel()
+    n = np.asarray(n_obs_per_biomarker, dtype=float).ravel()
+    if sse.shape != n.shape:
+        raise ValueError(
+            f"sse_per_biomarker shape {sse.shape} != n_obs_per_biomarker {n.shape}"
+        )
+    k = int(k_model)
+    ok = np.isfinite(sse) & np.isfinite(n) & (n > 0)
+    if not np.any(ok):
+        return float("nan"), float("nan")
+    sigma2 = np.maximum(sse[ok] / n[ok], 1e-12)
+    neg2 = float(np.sum(n[ok] * (LOG_2PI + np.log(sigma2) + 1.0)))
+    N = float(np.sum(n[ok]))
+    bic = neg2 + k * np.log(max(N, 1.0))
+    return float(bic), float(neg2)

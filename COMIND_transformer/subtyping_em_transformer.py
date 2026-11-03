@@ -64,6 +64,7 @@ from .utils import (
 _BACKENDS = {"numpy", "jax"}
 _ESTEP_MODES = {"current", "joint_grid"}
 _OBS_MODELS = ("scale", "zsym")
+_INITS = ("given", "kmeans")
 _ZSYM_S0 = 2.0  # zsym start: middle of the agreed s bounds [1, 3]
 _AT_UPPER_TOL = 1e-3
 
@@ -245,6 +246,17 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     and ``_sse_per_biomarker`` stay unweighted. ``score(weighted=True)`` uses
     the weights; ``score_blocks`` reports unweighted per-group MSE.
 
+    ``init="kmeans"`` makes ``fit`` pick its own start. It runs ``n_init``
+    restarts from ``initialization.initial_values`` (restart 0: k-means on each
+    subject's pattern over ``init_pattern_cols``; the others: small random f,
+    restart 3 with kappa = 0.1), seeded by ``random_state``, and keeps the
+    restart with the lowest penalized objective among non-failed ones
+    (``restarts_`` records every restart). ``initial_f`` / ``initial_s`` /
+    ``initial_kappa`` / ``initial_scalar_K`` / ``initial_assignments`` and
+    ``rng`` are then ignored, and per-subject ``initial_beta`` comes from the
+    patient dicts, so ``clone`` and ``sklearn.model_selection.cross_validate``
+    work directly. The default ``"given"`` uses the ``initial_*`` arguments.
+
     Diagnostics recorded every iteration (index 0 = initial state):
     ``subtype_counts_history_`` (n_subtypes, n_iter + 1),
     ``beta_at_upper_fraction_history_`` (fraction of patients with
@@ -322,6 +334,11 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         c_center: np.ndarray = None,
         obs_model: str = "scale",
         biomarker_weights: np.ndarray = None,
+        init: str = "given",
+        n_init: int = 1,
+        random_state: int = 75,
+        init_pattern_cols=None,
+        init_scalar_k_cap: float = None,
     ):
         self.max_iter = max_iter
         self.t_max = t_max
@@ -405,6 +422,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         # Per-biomarker loss weights w_b (None = all ones). sqrt(w_b) multiplies
         # the observation mask, so every squared residual is weighted by w_b.
         self.biomarker_weights = biomarker_weights
+        # init="kmeans": fit picks its own start over n_init restarts (class doc).
+        self.init = init
+        self.n_init = n_init
+        self.random_state = random_state
+        self.init_pattern_cols = init_pattern_cols
+        self.init_scalar_k_cap = init_scalar_k_cap
         self._validate_backend()
 
     def _validate_backend(self):
@@ -426,6 +449,10 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 )
         if getattr(self, "biomarker_weights", None) is not None and self.backend != "jax":
             raise ValueError("biomarker_weights requires backend='jax'")
+        if getattr(self, "init", "given") not in _INITS:
+            raise ValueError(f"init must be one of {_INITS}, got {self.init!r}")
+        if int(getattr(self, "n_init", 1)) < 1:
+            raise ValueError(f"n_init must be >= 1, got {self.n_init}")
         if self.estep_mode not in _ESTEP_MODES:
             raise ValueError(
                 f"estep_mode must be one of {sorted(_ESTEP_MODES)}, got {self.estep_mode!r}"
@@ -502,6 +529,132 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         n = self.n_beta_grid if self.estep_grid_size is None else int(self.estep_grid_size)
         return make_beta_grid(self.t_max, n)
 
+    def _fit_restarts(self, X: list):
+        """``init="kmeans"``: fit ``n_init`` starts and keep the best (class doc)."""
+        from sklearn.base import clone
+
+        from .initialization import (
+            init_ratio,
+            initial_values,
+            penalized_objective,
+            restart_is_failed,
+            select_restart,
+        )
+
+        B = np.asarray(X[0]["X_obs"]).shape[1]
+        c0 = np.zeros(B) if self.initial_c is None else np.asarray(self.initial_c, dtype=float)
+        cols = np.arange(B) if self.init_pattern_cols is None else self.init_pattern_cols
+        penalties = dict(
+            lambda_f=self.lambda_f,
+            lambda_kappa=self.lambda_kappa,
+            lambda_scalar=self.lambda_scalar,
+            scalar_K_center=self.scalar_K_center,
+        )
+        fits, records = [], []
+        for r in range(int(self.n_init)):
+            start = initial_values(
+                r, X, self.n_subtypes, c0, cols, self.scalar_K_center, self.random_state,
+                init_scalar_k_cap=self.init_scalar_k_cap,
+                zsym_s0=_ZSYM_S0 if self._is_zsym() else None,
+            )
+            em = clone(self).set_params(
+                init="given",
+                n_init=1,
+                rng=start["rng"],
+                **{k: start[k] for k in (
+                    "initial_f", "initial_s", "initial_kappa", "initial_scalar_K",
+                    "initial_assignments",
+                )},
+            )
+            em.fit(X)
+            ratio = init_ratio(em, X, c0, self.biomarker_weights)
+            records.append({
+                "restart": r,
+                "objective": penalized_objective(
+                    em, penalties, lambda_c=self.lambda_c, c_center=self.c_center
+                ),
+                "init_ratio": float(ratio),
+                "bic": float(em.bic_),
+                "lse_final": float(em.lse_final),
+                "failed": restart_is_failed(em, init_ratio_value=ratio, n_patients=len(X)),
+            })
+            fits.append(em)
+        chosen, failed_all = select_restart(records)
+        best = fits[chosen["restart"]]
+        param_names = set(self.get_params(deep=False))
+        for name, value in vars(best).items():
+            if name not in param_names:
+                setattr(self, name, value)
+        self.restarts_ = records
+        self.chosen_restart_ = int(chosen["restart"])
+        self.failed_all_restarts_ = bool(failed_all)
+        self.chosen_initial_f_ = np.asarray(best.initial_f, dtype=float)
+        return self
+
+    # Fitted state written by ``save``; enough for transform, score and CVIC.
+    _SAVED_ATTRS = (
+        "t_span", "cluster_f", "final_s", "final_c", "final_s_clip", "final_kappa",
+        "final_scalar_K", "final_assignments", "final_beta_", "cluster_cog_a",
+        "cluster_cog_b", "lse_final", "lse_history", "bic_", "bic_n_params_", "n_obs_",
+        "n_iter_", "stop_reason_", "s_lower_", "s_mask_", "beta_upper_",
+        "_sse_per_biomarker", "_var_per_biomarker_null", "sigma_sq_", "sigma_",
+        "subtype_prior_", "log_subtype_prior_", "beta_train_", "beta_var_",
+        "beta_kde_bandwidth_", "chosen_restart_", "failed_all_restarts_",
+        "chosen_initial_f_",
+    )
+    _HISTORY_ATTRS = (
+        "theta_history", "beta_history", "kappa_history", "assignment_history",
+        "subtype_counts_history_", "c_history_",
+    )
+
+    def save(self, path: str, histories: bool = False, **extra) -> str:
+        """
+        Write constructor params and fitted state to a compressed npz.
+
+        ``rng`` is not saved. ``histories=True`` adds the per-iteration EM
+        histories. ``extra`` arrays are stored under their own names (read
+        them back with ``np.load``). Returns ``path``.
+        """
+        out = {}
+        for name, value in self.get_params(deep=False).items():
+            if name != "rng" and value is not None:
+                out[f"param__{name}"] = np.asarray(value)
+        names = self._SAVED_ATTRS + (self._HISTORY_ATTRS if histories else ())
+        list_attrs = []
+        for name in names:
+            value = getattr(self, name, None)
+            if value is not None:
+                out[f"fit__{name}"] = np.asarray(value)
+                if isinstance(value, list):
+                    list_attrs.append(name)
+        out["list_attrs"] = np.array(list_attrs, dtype=str)
+        if getattr(self, "restarts_", None) is not None:
+            for key in self.restarts_[0]:
+                out[f"fit__restart_{key}"] = np.array([r[key] for r in self.restarts_])
+        for name, value in extra.items():
+            if name.startswith(("param__", "fit__")):
+                raise ValueError(f"extra key {name!r} uses a reserved prefix")
+            out[name] = np.asarray(value)
+        np.savez_compressed(path, **out)
+        return path
+
+    @classmethod
+    def load(cls, path: str) -> "SubtypingEM":
+        """Rebuild an estimator written by ``save``; ready for ``transform`` / ``score``."""
+        def _unbox(a):
+            return a.item() if a.ndim == 0 else a
+
+        with np.load(path, allow_pickle=False) as d:
+            params = {k[len("param__"):]: _unbox(d[k]) for k in d.files if k.startswith("param__")}
+            est = cls(**params)
+            list_attrs = set(d["list_attrs"].tolist()) if "list_attrs" in d.files else set()
+            for k in d.files:
+                if k.startswith("fit__") and not k.startswith("fit__restart_"):
+                    name = k[len("fit__"):]
+                    value = _unbox(d[k])
+                    setattr(est, name, list(value) if name in list_attrs else value)
+        return est
+
     def fit(self, X: list, y=None, checkpoint_path=None):
         """
         Fit on patient list ``X``.
@@ -514,6 +667,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             unless you pass it on fold fits (not recommended).
         """
         self._validate_backend()
+        if self.init == "kmeans":
+            return self._fit_restarts(X)
         self.t_span = np.linspace(0.0, self.t_max, int(self.t_max / self.step))
         self.assignment_probabilities_ = None
         self._checkpoint_path = checkpoint_path
@@ -2186,6 +2341,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
         self.theta_history = state["theta_hist"][:, :_h]
         self.beta_history = state["beta_hist"][:, :_h]
+        self.final_beta_ = np.asarray(self.beta_history, dtype=float)[:, -1].copy()
         self.kappa_history = state["kappa_hist"][:, :_h]
         self.lse_history = state["lse_hist"][:_h]
         self.lse_final = state["final_lse"]
