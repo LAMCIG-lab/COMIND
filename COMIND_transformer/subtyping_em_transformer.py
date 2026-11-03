@@ -2297,7 +2297,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
 
     def _store_cvic_empirical(self, state, flat):
         """Residual σ̂, subtype frequencies, and training β's for held-out CVIC."""
-        n_obs_b = np.asarray(flat["obs_weight"], dtype=np.float64).sum(axis=0)
+        n_obs_b = np.asarray(flat["obs_mask"], dtype=np.float64).sum(axis=0)
         sse = np.asarray(self._sse_per_biomarker, dtype=np.float64)
         self.sigma_sq_ = np.maximum(sse / np.maximum(n_obs_b, 1.0), 1e-12)
         self.sigma_ = np.sqrt(self.sigma_sq_)

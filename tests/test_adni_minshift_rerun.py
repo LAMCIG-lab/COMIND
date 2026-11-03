@@ -15,6 +15,8 @@ EXP_DIR = os.path.join(
     "experiments",
     "2026_10_27_ADNI_minshift_rerun",
 )
+if not os.path.exists(os.path.join(EXP_DIR, "run_comind_optuna_bic_noshift.py")):
+    pytest.skip("experiment driver not present (experiments/ is untracked)", allow_module_level=True)
 sys.path.insert(0, EXP_DIR)
 
 import importlib.util

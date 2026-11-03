@@ -248,3 +248,28 @@ def test_transform_on_training_matches_fit(weights):
     assert np.mean(tr["subtype"] == em.final_assignments) >= 0.95
     same = tr["subtype"] == em.final_assignments
     assert np.median(np.abs(tr["beta"][same] - beta_fit[same])) < 0.1
+
+
+# 8. CVIC with weights / zsym -------------------------------------------------------
+
+def test_cvic_sigma_uses_unweighted_counts():
+    toy = _zsym_toy([2.0] * 4, n_pat=30)
+    w = np.array([5.0, 1.0, 1.0, 0.2])
+    em = _zsym_em(toy, max_iter=3, biomarker_weights=w).fit(toy["pats"])
+    n_obs_b = np.isfinite(np.vstack([p["X_obs"] for p in toy["pats"]])).sum(axis=0)
+    assert np.allclose(em.sigma_sq_, em._sse_per_biomarker / n_obs_b, rtol=1e-12)
+
+
+def test_cvic_uses_zsym_shift(recovered):
+    toy, em = recovered
+    held_out = toy["pats"][:10]
+    ll = em.subject_loglik_cvic(held_out, n_gh=8)
+    assert np.all(np.isfinite(ll))
+    # c = -s is part of the zsym prediction; dropping it must hurt the fit.
+    c = em.final_c
+    em.final_c = np.zeros_like(c)
+    try:
+        ll_no_shift = em.subject_loglik_cvic(held_out, n_gh=8)
+    finally:
+        em.final_c = c
+    assert ll.sum() > ll_no_shift.sum()
