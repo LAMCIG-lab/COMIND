@@ -39,13 +39,16 @@ def main():
     workers = args.workers * len(args.n_subtypes) if len(args.workers) == 1 else args.workers
     if len(workers) != len(args.n_subtypes):
         ap.error("--workers needs one value, or one per --n-subtypes value")
+    # Jobs do not source the submitting shell, so forward the data root the configs expand.
+    data_root = f",COMIND_DATA={os.environ['COMIND_DATA']}" if os.environ.get("COMIND_DATA") else ""
     for arm in arms:
         for z, n_workers in zip(args.n_subtypes, workers):
+            env = f"CONFIG={config},ARM={arm},NSUB={z},COMIND_ROOT={ROOT}{data_root}"
             load_config(config, arm=None if arm == "main" else arm, n_subtypes=z)  # validate now
             logs = os.path.join(exp_dir, arm, f"k{z}", "logs")
             cmd = ["qsub", "-N", f"{os.path.basename(exp_dir)[:8]}_{arm}_k{z}", "-o", logs + "/",
                    "-t", f"0-{n_workers - 1}",
-                   "-v", f"CONFIG={config},ARM={arm},NSUB={z},COMIND_ROOT={ROOT}",
+                   "-v", env,
                    os.path.join(ROOT, "scripts", "submit.pbs")]
             if args.dry_run:
                 print(" ".join(cmd))
