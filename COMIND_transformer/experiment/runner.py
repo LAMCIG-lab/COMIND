@@ -63,6 +63,22 @@ def study_dir(exp_dir: str, cfg: ExperimentConfig) -> str:
     return os.path.join(exp_dir, cfg.arm, f"k{cfg.n_subtypes}")
 
 
+def _is_lock_error(exc: BaseException) -> bool:
+    """Optuna's NFS journal lock: another worker held or broke the lock file."""
+    msg = str(exc).lower()
+    return isinstance(exc, FileNotFoundError) or "lock" in msg or "possess" in msg
+
+
+def _with_lock_retry(fn):
+    for attempt in range(1, JOURNAL_RETRIES + 1):
+        try:
+            return fn()
+        except (OSError, RuntimeError) as exc:
+            if attempt == JOURNAL_RETRIES or not _is_lock_error(exc):
+                raise
+            time.sleep(attempt)
+
+
 def open_study(journal: str, name: str, n_startup: int) -> optuna.Study:
     """Load the study if it exists, else create it; retry while another worker holds the lock."""
     sampler = optuna.samplers.TPESampler(multivariate=True, group=True, constant_liar=True,
@@ -77,9 +93,7 @@ def open_study(journal: str, name: str, n_startup: int) -> optuna.Study:
             return optuna.create_study(study_name=name, storage=storage, direction="minimize",
                                        sampler=sampler, load_if_exists=True)
         except (OSError, RuntimeError) as exc:
-            msg = str(exc).lower()
-            if attempt == JOURNAL_RETRIES or not ("lock" in msg or "possess" in msg
-                                                  or isinstance(exc, FileNotFoundError)):
+            if attempt == JOURNAL_RETRIES or not _is_lock_error(exc):
                 raise
             time.sleep(attempt)
     raise AssertionError("unreachable")
@@ -135,7 +149,9 @@ def make_objective(cfg: ExperimentConfig, data: Dataset, base: SubtypingEM, tria
                  val_ids=[str(p["id"]) for p in data.x_val],
                  val_beta=val["beta"], val_subtype=val["subtype"], **cv_extra)
         for key, v in json_safe(attrs).items():
-            trial.set_user_attr(key, v)
+            # ~45 locked appends per trial; with hundreds of workers on NFS one occasionally
+            # finds its lock broken ("did not possess lock"). Retry rather than lose the fit.
+            _with_lock_retry(lambda: trial.set_user_attr(key, v))
         print(f"trial {trial.number}: {cfg.objective}={value:.6g} val_lse={attrs['val_lse']:.6g} "
               f"bic={attrs['bic']:.6g} [{attrs['fit_seconds']:.0f}s]", flush=True)
         if not np.isfinite(value):
@@ -183,5 +199,11 @@ def run_worker(cfg: ExperimentConfig, exp_dir: str, *, config_path: str,
         live = sum(t.state in (TrialState.COMPLETE, TrialState.RUNNING) for t in study.trials)
         if live >= budget:
             break
-        study.optimize(objective, n_trials=1, timeout=t_end - time.time())
+        try:
+            study.optimize(objective, n_trials=1, timeout=t_end - time.time())
+        except (OSError, RuntimeError) as exc:
+            if not _is_lock_error(exc):
+                raise
+            # Optuna's own journal write (e.g. the final tell) lost the lock: keep the worker.
+            print(f"journal lock error, continuing: {exc}", flush=True)
     return study

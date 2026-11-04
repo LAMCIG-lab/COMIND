@@ -134,3 +134,16 @@ def test_results_loader(config_path, data):
     assert traj.shape == (2, len(t_span), 4)
     assert len(R.visits(t)) == sum(np.isfinite(p["X_obs"]).sum() for p in data.x_train + data.x_val)
     assert len(R.visit_metadata(t)) == sum(len(p["dt"]) for p in data.x_train + data.x_val)
+
+
+def test_lock_error_is_retried(monkeypatch):
+    calls = []
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("Error: did not possess lock")
+        return "ok"
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    assert runner._with_lock_retry(flaky) == "ok" and len(calls) == 3
+    with pytest.raises(ValueError):
+        runner._with_lock_retry(lambda: (_ for _ in ()).throw(ValueError("not a lock error")))
