@@ -3,7 +3,7 @@ Fresh-fold CVIC for each Z's best trial (see COMIND_transformer/experiment/resco
 
     python scripts/rescore_cvic.py experiments/<dated> --arm W0 --n-subtypes 1 2 3 4 5   # qsub one array per Z
     python scripts/rescore_cvic.py experiments/<dated> --arm W0 --n-subtypes 3 --fold 0  # one fold, here
-    python scripts/select_z.py experiments/<dated> --arms W0 --rescored                  # when all are done
+    python scripts/select_z.py experiments/<dated> --arms W0                             # when all are done
 
 Run it after the studies finish: the best trial must not change afterwards.
 """

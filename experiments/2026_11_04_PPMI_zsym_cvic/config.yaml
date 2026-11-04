@@ -3,7 +3,8 @@
 # Speed: step 0.05 (4.6x, same fit to 1e-7) and inner_ftol 1e-7 (1.7x, LSE within 0.01%).
 #   python scripts/run_experiment.py <this file> --arm W0 --smoke
 #   python scripts/submit_arms.py <this file> --n-subtypes 1 2 3 4 5 --workers 4 9 15 22 28
-#   python scripts/select_z.py <this folder>   # ordered Tukey test on CVIC, per arm
+#   python scripts/rescore_cvic.py <this folder> --arm W0 --n-subtypes 1 2 3 4 5   # fresh-fold CVIC
+#   python scripts/select_z.py <this folder>   # ordered Tukey test on fresh-fold CVIC, per arm
 # More trials later: resubmit with a larger n_trials; workers resume the same studies.
 dataset: ppmi
 data_csv: $COMIND_DATA/PPMI_deviation_scores.csv
@@ -32,7 +33,7 @@ search_space:
   lambda_f: [1.0e-2, 1.0e6, true]
   lambda_kappa: [1.0e-2, 1.0e4, true]
   lambda_scalar: [1.0e-2, 1.0e3, true]
-n_trials: 60
+n_trials: 80  # 60 at launch; extended by 20 on 2026-11-04
 n_startup_trials: 15
 worker_hours: 71.5
 arms:
