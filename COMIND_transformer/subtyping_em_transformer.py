@@ -257,6 +257,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     patient dicts, so ``clone`` and ``sklearn.model_selection.cross_validate``
     work directly. The default ``"given"`` uses the ``initial_*`` arguments.
 
+    ``inner_ftol`` (JAX backend) is the L-BFGS-B ``ftol`` of the globals and
+    cluster-f steps. The default ``None`` keeps scipy's 2.2e-9, which solves
+    every M-step far past what the outer EM loop needs: on ADNI zsym, 1e-7 is
+    1.7x faster with the same assignments and LSE within 0.01% after 25
+    iterations (1e-6 is 3x faster but 0.15% worse).
+
     Diagnostics recorded every iteration (index 0 = initial state):
     ``subtype_counts_history_`` (n_subtypes, n_iter + 1),
     ``beta_at_upper_fraction_history_`` (fraction of patients with
@@ -339,6 +345,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         random_state: int = 75,
         init_pattern_cols=None,
         init_scalar_k_cap: float = None,
+        inner_ftol: float = None,
     ):
         self.max_iter = max_iter
         self.t_max = t_max
@@ -428,6 +435,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         self.random_state = random_state
         self.init_pattern_cols = init_pattern_cols
         self.init_scalar_k_cap = init_scalar_k_cap
+        # JAX globals / cluster-f L-BFGS-B ftol (None = scipy's 2.2e-9); see class doc.
+        self.inner_ftol = inner_ftol
         self._validate_backend()
 
     def _validate_backend(self):
@@ -534,6 +543,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
         from sklearn.base import clone
 
         from .initialization import (
+            FAILED_INIT_RATIO,
             init_ratio,
             initial_values,
             penalized_objective,
@@ -576,7 +586,12 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
                 "init_ratio": float(ratio),
                 "bic": float(em.bic_),
                 "lse_final": float(em.lse_final),
-                "failed": restart_is_failed(em, init_ratio_value=ratio, n_patients=len(X)),
+                # A zsym start predicts z = -s0 for everyone, so its init_ratio is
+                # always above 1; only the empty-subtype check applies there.
+                "failed": restart_is_failed(
+                    em, init_ratio_value=ratio, n_patients=len(X),
+                    init_ratio_max=np.inf if self._is_zsym() else FAILED_INIT_RATIO,
+                ),
             })
             fits.append(em)
         chosen, failed_all = select_restart(records)
@@ -2095,6 +2110,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             assignments=state["assignments"],
             cluster_f=state["cluster_f"],
             strict_tol=self.strict_tol,
+            ftol=self.inner_ftol,
             obs_weight=flat["obs_weight"],
             packed=packed,
         )
@@ -2184,6 +2200,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             beta_pred=state["current_beta"],
             kappa=state["current_kappa"],
             strict_tol=self.strict_tol,
+            ftol=self.inner_ftol,
             obs_weight=flat["obs_weight"],
             packed=packed,
             info=f_info,
@@ -2269,6 +2286,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             scalar_K_center=self.scalar_K_center,
             fit_s=self.fit_s,
             strict_tol=self.strict_tol,
+            ftol=self.inner_ftol,
             obs_weight=flat["obs_weight"],
             s_mask=self.s_mask_,
             s_lower=flat["s_lower"],
@@ -2318,6 +2336,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             scalar_K_center=self.scalar_K_center,
             fit_s=self.fit_s,
             strict_tol=self.strict_tol,
+            ftol=self.inner_ftol,
             obs_weight=flat["obs_weight"],
             s_mask=self.s_mask_,
             s_lower=flat["s_lower"],
@@ -2563,6 +2582,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             beta_pred=beta,
             kappa=np.asarray(self.final_kappa, dtype=float),
             strict_tol=self.strict_tol,
+            ftol=self.inner_ftol,
             obs_weight=flat["obs_weight"],
             packed=(packed, meta),
             info=info,

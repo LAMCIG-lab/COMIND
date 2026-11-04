@@ -73,8 +73,13 @@ class _Guard:
         return _NONFINITE_LOSS, np.zeros_like(grad)
 
 
-def _lbfgs_options(strict_tol: bool, base: Optional[dict] = None) -> Optional[dict]:
+def _lbfgs_options(
+    strict_tol: bool, base: Optional[dict] = None, ftol: Optional[float] = None
+) -> Optional[dict]:
+    """scipy L-BFGS-B options. ``ftol`` (None = scipy's 2.2e-9) loosens the inner stop."""
     opts = dict(base or {})
+    if ftol is not None:
+        opts["ftol"] = float(ftol)
     if strict_tol:
         opts.update(_STRICT_OPTIONS)
     return opts or None
@@ -211,6 +216,7 @@ def fit_theta_globals_jax(
     fit_s: bool = True,
     method: str = "jax",
     strict_tol: bool = False,
+    ftol: Optional[float] = None,
     ode_method: str = "LSODA",
     obs_weight: np.ndarray = None,
     s_mask=None,
@@ -321,7 +327,7 @@ def fit_theta_globals_jax(
         method="L-BFGS-B",
         jac=True,
         bounds=bounds,
-        options=_lbfgs_options(strict_tol),
+        options=_lbfgs_options(strict_tol, ftol=ftol),
     )
 
     s_fit = np.asarray(result.x[:B], dtype=float).copy()
@@ -359,6 +365,7 @@ def fit_theta_globals_intercept_jax(
     scalar_K_center: float = SCALAR_K_CENTER,
     fit_s: bool = True,
     strict_tol: bool = False,
+    ftol: Optional[float] = None,
     obs_weight: np.ndarray = None,
     s_mask=None,
     s_lower: np.ndarray = None,
@@ -455,7 +462,7 @@ def fit_theta_globals_intercept_jax(
 
     result = minimize(
         objective, x0=x0, method="L-BFGS-B", jac=True, bounds=bounds,
-        options=_lbfgs_options(strict_tol),
+        options=_lbfgs_options(strict_tol, ftol=ftol),
     )
     s_fit = np.asarray(result.x[:B], dtype=float).copy()
     s_fit[~s_mask_bool] = 1.0
@@ -487,6 +494,7 @@ def fit_theta_globals_zsym_jax(
     scalar_K_center: float = SCALAR_K_CENTER,
     fit_s: bool = True,
     strict_tol: bool = False,
+    ftol: Optional[float] = None,
     obs_weight: np.ndarray = None,
     s_mask=None,
     s_lower: np.ndarray = None,
@@ -567,7 +575,7 @@ def fit_theta_globals_zsym_jax(
 
     result = minimize(
         objective, x0=x0, method="L-BFGS-B", jac=True, bounds=bounds,
-        options=_lbfgs_options(strict_tol),
+        options=_lbfgs_options(strict_tol, ftol=ftol),
     )
     s_fit = np.asarray(result.x[:B], dtype=float).copy()
     s_fit[~s_mask_bool] = 1.0
@@ -596,6 +604,7 @@ def fit_theta_cluster_all_jax(
     beta_pred: np.ndarray,
     kappa: np.ndarray = None,
     strict_tol: bool = False,
+    ftol: Optional[float] = None,
     obs_weight: np.ndarray = None,
     packed: Optional[tuple] = None,
     info: Optional[dict] = None,
@@ -688,7 +697,7 @@ def fit_theta_cluster_all_jax(
         method="L-BFGS-B",
         jac=True,
         bounds=bounds,
-        options=_lbfgs_options(strict_tol),
+        options=_lbfgs_options(strict_tol, ftol=ftol),
     )
 
     F_fit = np.asarray(result.x, dtype=float).reshape(Z, n_biomarkers).copy()

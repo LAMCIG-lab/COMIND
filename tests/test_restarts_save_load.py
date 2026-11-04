@@ -72,3 +72,28 @@ def test_save_load_round_trip(toy, fitted, tmp_path):
     assert est.score_cvic(held_out, n_gh=6) == pytest.approx(fitted.score_cvic(held_out, n_gh=6))
     np.testing.assert_array_equal(est.final_beta_, fitted.final_beta_)
     assert np.load(path)["val_ids"].tolist() == list(range(5))
+
+
+
+def test_zsym_restarts_not_failed_by_init_ratio(toy, monkeypatch):
+    # A zsym start over-predicts by construction (real ADNI: ratio 1.7-2.4). That alone
+    # must not fail a restart, or selection silently drops the empty-subtype check.
+    from COMIND_transformer import initialization
+    monkeypatch.setattr(initialization, "init_ratio", lambda *a, **k: 5.0)
+    em = _em(toy).fit(toy["pats"])
+    assert all(r["init_ratio"] == 5.0 for r in em.restarts_)
+    counts = np.asarray(em.subtype_counts_history_)[:, 2]
+    assert counts.min() >= 0.02 * len(toy["pats"])  # so no restart should fail
+    assert not any(r["failed"] for r in em.restarts_) and not em.failed_all_restarts_
+
+
+def test_inner_ftol_reaches_globals_and_f_steps(toy, monkeypatch):
+    import COMIND_transformer.optimizer_jax as oj
+    seen = []
+    real = oj.minimize
+    monkeypatch.setattr(oj, "minimize", lambda *a, **k: seen.append((k.get("options") or {}).get("ftol")) or real(*a, **k))
+    _em(toy, init="given", n_init=1, max_iter=1, inner_ftol=1e-7).fit(toy["pats"])
+    assert seen.count(1e-7) >= 2  # globals and cluster-f; the beta step keeps its own options
+    seen.clear()
+    _em(toy, init="given", n_init=1, max_iter=1).fit(toy["pats"])
+    assert 1e-7 not in seen
