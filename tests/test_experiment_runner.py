@@ -119,6 +119,19 @@ def test_select_z_across_studies(config_path, data):
     assert len(res["tests"]) == 1
     json.dumps(res)
 
+    from COMIND_transformer.experiment.rescore import rescore_fold
+    with pytest.raises(FileNotFoundError):
+        select_z(exp_dir, "S0", rescored=True, n_draw=2000)
+    for z in (1, 2):
+        for fold in range(3):
+            rescore_fold(os.path.join(exp_dir, "S0", f"k{z}"), fold)
+    fresh = select_z(exp_dir, "S0", rescored=True, n_draw=2000)
+    assert fresh["rescored"] and fresh["selected_n_subtypes"] in (1, 2)
+    for z in (1, 2):
+        assert fresh["cvic"][z] == pytest.approx(fresh["best_trials"][z]["rescored_cvic"])
+        assert fresh["cvic"][z] != pytest.approx(res["cvic"][z])  # different folds, different score
+    json.dumps(fresh)
+
 
 def test_results_loader(config_path, data):
     from COMIND_transformer.experiment import results as R

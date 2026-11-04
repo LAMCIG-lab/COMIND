@@ -1,0 +1,16 @@
+#!/bin/bash
+# One fresh-fold CVIC fit (fold = PBS_ARRAYID). Submitted by scripts/rescore_cvic.py.
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=12:00:00
+#PBS -l mem=8gb
+#PBS -j oe
+#PBS -m a
+
+set -eo pipefail
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate comind
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1
+export PYTHONPATH="${COMIND_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+echo "PBS_JOBID=${PBS_JOBID:-} EXP_DIR=${EXP_DIR} ARM=${ARM} NSUB=${NSUB} FOLD=${PBS_ARRAYID}"
+python "${COMIND_ROOT}/scripts/rescore_cvic.py" "${EXP_DIR}" --arm "${ARM}" --n-subtypes "${NSUB}" --fold "${PBS_ARRAYID}"

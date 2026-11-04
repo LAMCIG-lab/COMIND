@@ -20,13 +20,16 @@ def main():
     ap.add_argument("--arms", nargs="+", help="default: every arm in config.yaml")
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--no-bonferroni", action="store_true")
+    ap.add_argument("--rescored", action="store_true",
+                    help="test the fresh-fold CVIC from scripts/rescore_cvic.py (recommended)")
     ap.add_argument("--by", default="cv_cvic", help="trial attr picking each Z's best trial ('objective' = study objective)")
     args = ap.parse_args()
 
     for arm in args.arms or arm_names(os.path.join(args.exp_dir, "config.yaml")):
         res = select_z(args.exp_dir, arm, by=None if args.by == "objective" else args.by,
-                       alpha=args.alpha, bonferroni=not args.no_bonferroni)
-        with open(os.path.join(args.exp_dir, arm, "z_selection.json"), "w") as f:
+                       rescored=args.rescored, alpha=args.alpha, bonferroni=not args.no_bonferroni)
+        name = "z_selection_rescored.json" if args.rescored else "z_selection.json"
+        with open(os.path.join(args.exp_dir, arm, name), "w") as f:
             json.dump(res, f, indent=2)
         cvic = "  ".join(f"Z={z}:{v:.1f}" for z, v in res["cvic"].items())
         print(f"{arm}: selected Z={res['selected_n_subtypes']}  CVIC {cvic}")

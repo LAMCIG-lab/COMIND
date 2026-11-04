@@ -42,9 +42,15 @@ def best_trial(study_dir: str, by: Optional[str] = "cv_cvic") -> FrozenTrial:
     return min(done, key=lambda t: t.value if by is None else t.user_attrs[by])
 
 
-def select_z(exp_dir: str, arm: str, *, by: Optional[str] = "cv_cvic", alpha: float = 0.05,
-             bonferroni: bool = True, n_draw: int = 200_000, seed: int = 0) -> Dict[str, Any]:
-    """Run the ordered Tukey test over every ``<exp_dir>/<arm>/k<Z>`` study."""
+def select_z(exp_dir: str, arm: str, *, by: Optional[str] = "cv_cvic", rescored: bool = False,
+             alpha: float = 0.05, bonferroni: bool = True, n_draw: int = 200_000,
+             seed: int = 0) -> Dict[str, Any]:
+    """Run the ordered Tukey test over every ``<exp_dir>/<arm>/k<Z>`` study.
+
+    ``rescored=True`` tests the fresh-fold scores of ``rescore.py`` (see there) instead of
+    the in-study CV scores the best trial was chosen on.
+    """
+    from .rescore import collect
     dirs = glob.glob(os.path.join(exp_dir, arm, "k*", "journal.log"))
     zs = sorted(int(re.search(r"k(\d+)$", os.path.dirname(d)).group(1)) for d in dirs)
     if len(zs) < 2:
@@ -56,18 +62,26 @@ def select_z(exp_dir: str, arm: str, *, by: Optional[str] = "cv_cvic", alpha: fl
     for z in zs:
         out = os.path.join(exp_dir, arm, f"k{z}")
         t = best_trial(out, by=by)
-        with np.load(os.path.join(out, "trials", f"{t.number:04d}.npz")) as npz:
-            if "cv_loglik" not in npz:
-                raise ValueError(f"{out} trial {t.number} has no cv_loglik (run with cvic: false?)")
-            ids, fold = npz["train_ids"].tolist(), npz["cv_fold"]
-            cols.append(np.asarray(npz["cv_loglik"], float))
+        if rescored:
+            loglik, fold, ids, number = collect(out)
+            if number != t.number:
+                raise ValueError(f"{out}: rescored trial {number}, but the best trial is now "
+                                 f"{t.number}; rescore again")
+            cols.append(loglik)
+        else:
+            with np.load(os.path.join(out, "trials", f"{t.number:04d}.npz")) as npz:
+                if "cv_loglik" not in npz:
+                    raise ValueError(f"{out} trial {t.number} has no cv_loglik (run with cvic: false?)")
+                ids, fold = npz["train_ids"].tolist(), npz["cv_fold"]
+                cols.append(np.asarray(npz["cv_loglik"], float))
         # Tukey compares Z subject by subject, so every Z must hold out the same subjects together.
         if ref is None:
             ref = (ids, fold)
         elif ids != ref[0] or not np.array_equal(fold, ref[1]):
             raise ValueError(f"{out}: training subjects or CV folds differ from k{zs[0]}")
         trials[z] = {"trial": t.number, "objective": t.value, "params": t.params,
-                     "cv_cvic": t.user_attrs.get("cv_cvic")}
+                     "cv_cvic": t.user_attrs.get("cv_cvic"),
+                     **({"rescored_cvic": float(-2.0 * cols[-1].sum())} if rescored else {})}
 
     n_folds = int(ref[1].max()) + 1
     idx, info = ordered_tukey_nb(np.column_stack(cols), n_folds=n_folds, alpha=alpha,
@@ -76,7 +90,7 @@ def select_z(exp_dir: str, arm: str, *, by: Optional[str] = "cv_cvic", alpha: fl
     tests = [{"z": zs[i], "gap": float(info["gaps"][i]), "se": float(info["se"][i]),
               "p": float(info["pvalues"][i]), "rejected": bool(info["rejected"][i])}
              for i in range(len(zs) - 1) if np.isfinite(info["pvalues"][i])]
-    return {"arm": arm, "selected_n_subtypes": zs[idx - 1], "candidates": zs, "best_by": by or "objective",
+    return {"arm": arm, "selected_n_subtypes": zs[idx - 1], "candidates": zs, "best_by": by or "objective", "rescored": rescored,
             "cvic": dict(zip(zs, info["cvic"].tolist())), "tests": tests,
             "alpha_per_test": info["alpha"], "bonferroni": bonferroni,
             "n_subjects": len(ref[0]), "n_folds": n_folds, "best_trials": trials}
