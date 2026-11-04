@@ -1,0 +1,43 @@
+# ADNI, zsym (fit s only; c tied to -s), z-score inputs, CVIC for choosing Z.
+# W0 = equal biomarker weights, W50 = clinical scores get half of the loss.
+# Speed: step 0.05 (4.6x, same fit to 1e-7) and inner_ftol 1e-7 (1.7x, LSE within 0.01%).
+#   python scripts/run_experiment.py <this file> --arm W0 --smoke
+#   python scripts/submit_arms.py <this file> --n-subtypes 1 2 3 4 5 --workers 4 9 15 22 28
+#   python scripts/select_z.py <this folder>   # ordered Tukey test on CVIC, per arm
+# More trials later: resubmit with a larger n_trials; workers resume the same studies.
+dataset: adni
+data_csv: $COMIND_DATA/adni/yuto_obs_v2/ADNI_longitudinal_yuto_obs_harmonized.csv
+connectome: $COMIND_DATA/iit_connectivity_matrix/connectome_experiment_10_19_2026/K_82_log_knn8_row.csv
+n_subtypes: 3
+data:
+  include_cn_amyloid_pos: true
+  cn_apos_in_main_split: true
+estimator:
+  obs_model: zsym
+  step: 0.05
+  inner_ftol: 1.0e-7
+  max_iter: 80
+  min_iter: 25
+  stop_rel_tol: 1.0e-4
+  stop_patience: 5
+  fit_s: true
+  s_lower_value: 1.0
+  s_upper: 3.0
+  init_scalar_k_cap: 0.02
+  lambda_jsd: 0.0
+  scalar_K_center: 0.25
+n_init: 2
+objective: cv_lse
+cv_folds: 3
+cvic: true
+polish_f: true
+search_space:
+  lambda_f: [1.0e-2, 1.0e6, true]
+  lambda_kappa: [1.0e-2, 1.0e4, true]
+  lambda_scalar: [1.0e-2, 1.0e3, true]
+n_trials: 60
+n_startup_trials: 15
+worker_hours: 71.5
+arms:
+  W0: {}
+  W50: {clinical_weight_share: 0.5}
