@@ -6,8 +6,8 @@ Notebook access to a study's trials. Read-only; works while the study runs.
     t = R.load_trial("experiments/<dated>/W0/k3", df["cv_cvic"].idxmin())   # best by CVIC
     t.est                      # fitted SubtypingEM (transform, score, score_cvic, ...)
     t.subjects                 # id, split, beta, subtype, baseline metadata (NSD, PTAU_bl, ...)
-    t_span, traj = R.trajectories(t.est)       # (Z, T, B) on the z scale
-    R.visits(t)                # long table of every observation for spaghetti plots
+    t_span, x = R.trajectories(t.est)          # (Z, T, B) ODE x in [0, 1]
+    R.visits(t)                # every observation: z value and ODE-space x, for spaghetti plots
     R.visit_metadata(t)        # one row per visit: disease time + NSD / PTAU / DX ...
 
 The trial npz holds the model and each subject's placement, not the data:
@@ -95,8 +95,8 @@ def load_trial(study_dir: str, number: int) -> Trial:
     return Trial(int(number), est, ExperimentConfig(**resolved), data, npz, subjects)
 
 
-def trajectories(est: SubtypingEM, z_scale: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-    """``(t_span, traj)`` with traj (Z, T, B): model x, or the prediction c + s x on the z scale."""
+def trajectories(est: SubtypingEM, z_scale: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    """``(t_span, traj)`` with traj (Z, T, B): ODE x in [0, 1] (default), or c + s x on the z scale."""
     x = np.asarray(solve_trajectories_jax(est.cluster_f, est.final_kappa, est.final_scalar_K,
                                           est.K, est.t_span))
     if not z_scale:
@@ -105,8 +105,22 @@ def trajectories(est: SubtypingEM, z_scale: bool = True) -> Tuple[np.ndarray, np
     return est.t_span, est._final_c_or_zero(B) + np.ravel(est.final_s)[None, None, :] * x
 
 
-def visits(trial: Trial) -> pd.DataFrame:
-    """Every observed value: id, split, subtype, disease time (beta + dt), biomarker, value."""
+def to_ode_space(est: SubtypingEM, z: np.ndarray, clip: bool = True) -> np.ndarray:
+    """Observations (..., B) on the z scale -> ODE space x, the inverse of ``c + s x``.
+
+    zsym: ``x = (z + s) / (2 s)`` with ``s`` the clipping level, so x in [0, 1] covers
+    z in [-s, s]; ``clip`` puts values beyond the plateaus at 0 / 1 (Boris's map). The
+    fit itself uses the raw z; clipping is for display.
+    """
+    z = np.asarray(z, dtype=float)
+    B = z.shape[-1]
+    x = (z - est._final_c_or_zero(B)) / np.ravel(est.final_s).astype(float)
+    return np.clip(x, 0.0, 1.0) if clip else x
+
+
+def visits(trial: Trial, clip: bool = True) -> pd.DataFrame:
+    """Every observed value: id, split, subtype, disease time (beta + dt), biomarker,
+    ``value`` (z scale, as fitted) and ``x`` (ODE space, see ``to_ode_space``)."""
     names = trial.data.x_cols
     place = trial.subjects.set_index(["split", "id"])
     rows = []
@@ -114,10 +128,12 @@ def visits(trial: Trial) -> pd.DataFrame:
         for p in patients:
             s = place.loc[(split, str(p["id"]))]
             X = np.asarray(p["X_obs"], float)
+            Xode = to_ode_space(trial.est, X, clip=clip)
             for j, dt in enumerate(np.asarray(p["dt"], float)):
                 ok = np.isfinite(X[j])
                 rows.extend({"id": str(p["id"]), "split": split, "subtype": int(s["subtype"]),
-                             "time": float(s["beta"]) + dt, "biomarker": names[b], "value": X[j, b]}
+                             "time": float(s["beta"]) + dt, "biomarker": names[b], "value": X[j, b],
+                             "x": Xode[j, b]}
                             for b in np.flatnonzero(ok))
     return pd.DataFrame(rows)
 

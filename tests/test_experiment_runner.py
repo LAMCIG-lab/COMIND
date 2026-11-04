@@ -143,9 +143,17 @@ def test_results_loader(config_path, data):
     t = R.load_trial(out, 0)
     assert t.subjects.split.value_counts().to_dict() == {"train": 24, "val": 6}
     np.testing.assert_allclose(t.subjects.query("split == 'val'").beta, t.npz["val_beta"])
-    t_span, traj = R.trajectories(t.est)
-    assert traj.shape == (2, len(t_span), 4)
-    assert len(R.visits(t)) == sum(np.isfinite(p["X_obs"]).sum() for p in data.x_train + data.x_val)
+    t_span, x = R.trajectories(t.est)
+    assert x.shape == (2, len(t_span), 4) and x.min() >= 0 and x.max() <= 1 + 1e-6  # RK4 rounding
+    _, zhat = R.trajectories(t.est, z_scale=True)
+    s = t.est.final_s_clip  # zsym: z_hat = s (2x - 1), and to_ode_space inverts it
+    np.testing.assert_allclose(zhat, s * (2 * x - 1), atol=1e-12)
+    np.testing.assert_allclose(R.to_ode_space(t.est, zhat, clip=False), x, atol=1e-12)
+    v = R.visits(t)
+    assert len(v) == sum(np.isfinite(p["X_obs"]).sum() for p in data.x_train + data.x_val)
+    assert v.x.between(0, 1).all()
+    s_b = np.asarray(s)[[t.data.x_cols.index(b) for b in v.biomarker]]
+    np.testing.assert_allclose(v.x, np.clip((v.value + s_b) / (2 * s_b), 0, 1))
     assert len(R.visit_metadata(t)) == sum(len(p["dt"]) for p in data.x_train + data.x_val)
 
 
