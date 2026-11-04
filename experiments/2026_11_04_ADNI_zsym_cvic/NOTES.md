@@ -9,7 +9,8 @@ inner_ftol 1e-7. Searched: lambda_f, lambda_kappa, lambda_scalar. Fixed:
 lambda_jsd = 0, scalar_K_center = 0.25 (no measurable effect in the 10_28 /
 11_02 studies). Clinical inputs are still the placeholder z-score.
 
-Order: W0 first; W50 was paused at ~10-36 trials per study and resumed after W0 finished.
+Order: W0 first. W50 was paused at 6-20 trials per study and is deferred to a later run
+(resubmit with --arms W50; the studies resume where they stopped).
 
 CVIC: each Z's trial is the lowest search-fold CVIC; every reported CVIC and the Tukey test use
 fresh-fold re-scores (rescore_cvic.py, seed + 1000). Compare arms with CVIC and the external
