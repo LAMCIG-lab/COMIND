@@ -3,7 +3,7 @@ Notebook access to a study's trials. Read-only; works while the study runs.
 
     from COMIND_transformer.experiment import results as R
     df = R.trials_table("experiments/<dated>/W0/k3")   # one row per complete trial
-    t = R.load_trial("experiments/<dated>/W0/k3", df["bic"].idxmin())
+    t = R.load_trial("experiments/<dated>/W0/k3", df["cv_cvic"].idxmin())   # best by CVIC
     t.est                      # fitted SubtypingEM (transform, score, score_cvic, ...)
     t.subjects                 # id, split, beta, subtype, baseline metadata (NSD, PTAU_bl, ...)
     t_span, traj = R.trajectories(t.est)       # (Z, T, B) on the z scale

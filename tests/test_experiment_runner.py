@@ -113,7 +113,7 @@ def test_select_z_across_studies(config_path, data):
         runner.run_worker(load_config(config_path, arm="S0", n_subtypes=z), exp_dir, config_path=config_path)
     res = select_z(exp_dir, "S0", n_draw=2000)
     assert res["candidates"] == [1, 2] and res["selected_n_subtypes"] in (1, 2)
-    assert res["n_subjects"] == 24 and res["n_folds"] == 3
+    assert res["n_subjects"] == 24 and res["n_folds"] == 3 and res["best_by"] == "cv_cvic"
     for z in (1, 2):
         assert res["cvic"][z] == pytest.approx(res["best_trials"][z]["cv_cvic"])
     assert len(res["tests"]) == 1

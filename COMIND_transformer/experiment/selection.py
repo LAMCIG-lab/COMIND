@@ -1,7 +1,8 @@
 """
 Choose n_subtypes for one arm: the ordered Tukey test on held-out CVIC.
 
-Each ``<arm>/k<Z>`` study contributes its best trial (lowest study objective).
+Each ``<arm>/k<Z>`` study contributes its best trial: lowest ``cv_cvic`` by
+default (``by=None`` uses the study objective instead).
 That trial's npz holds ``cv_loglik``, the held-out log density of every
 training subject from the CV fold that left it out. Stacking those columns
 over Z gives the (n_subjects, n_Z) matrix that ``cvic.ordered_tukey_nb``
@@ -16,7 +17,7 @@ from __future__ import annotations
 import glob
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import optuna
@@ -27,20 +28,22 @@ from optuna.trial import FrozenTrial, TrialState
 from ..cvic import ordered_tukey_nb
 
 
-def best_trial(study_dir: str) -> FrozenTrial:
-    """Lowest-objective COMPLETE trial of the study in ``study_dir`` (read-only)."""
+def best_trial(study_dir: str, by: Optional[str] = "cv_cvic") -> FrozenTrial:
+    """COMPLETE trial with the lowest user attr ``by`` (None = study objective). Read-only."""
     journal = os.path.join(study_dir, "journal.log")
     storage = JournalStorage(JournalFileBackend(journal, lock_obj=JournalFileOpenLock(journal)))
     (name,) = optuna.get_all_study_names(storage=storage)
     done = [t for t in optuna.load_study(study_name=name, storage=storage).trials
             if t.state == TrialState.COMPLETE]
+    if by is not None:
+        done = [t for t in done if t.user_attrs.get(by) is not None]
     if not done:
-        raise ValueError(f"{study_dir}: no complete trials")
-    return min(done, key=lambda t: t.value)
+        raise ValueError(f"{study_dir}: no complete trials" + (f" with {by}" if by else ""))
+    return min(done, key=lambda t: t.value if by is None else t.user_attrs[by])
 
 
-def select_z(exp_dir: str, arm: str, *, alpha: float = 0.05, bonferroni: bool = True,
-             n_draw: int = 200_000, seed: int = 0) -> Dict[str, Any]:
+def select_z(exp_dir: str, arm: str, *, by: Optional[str] = "cv_cvic", alpha: float = 0.05,
+             bonferroni: bool = True, n_draw: int = 200_000, seed: int = 0) -> Dict[str, Any]:
     """Run the ordered Tukey test over every ``<exp_dir>/<arm>/k<Z>`` study."""
     dirs = glob.glob(os.path.join(exp_dir, arm, "k*", "journal.log"))
     zs = sorted(int(re.search(r"k(\d+)$", os.path.dirname(d)).group(1)) for d in dirs)
@@ -52,7 +55,7 @@ def select_z(exp_dir: str, arm: str, *, alpha: float = 0.05, bonferroni: bool = 
     ref = None
     for z in zs:
         out = os.path.join(exp_dir, arm, f"k{z}")
-        t = best_trial(out)
+        t = best_trial(out, by=by)
         with np.load(os.path.join(out, "trials", f"{t.number:04d}.npz")) as npz:
             if "cv_loglik" not in npz:
                 raise ValueError(f"{out} trial {t.number} has no cv_loglik (run with cvic: false?)")
@@ -73,7 +76,7 @@ def select_z(exp_dir: str, arm: str, *, alpha: float = 0.05, bonferroni: bool = 
     tests = [{"z": zs[i], "gap": float(info["gaps"][i]), "se": float(info["se"][i]),
               "p": float(info["pvalues"][i]), "rejected": bool(info["rejected"][i])}
              for i in range(len(zs) - 1) if np.isfinite(info["pvalues"][i])]
-    return {"arm": arm, "selected_n_subtypes": zs[idx - 1], "candidates": zs,
+    return {"arm": arm, "selected_n_subtypes": zs[idx - 1], "candidates": zs, "best_by": by or "objective",
             "cvic": dict(zip(zs, info["cvic"].tolist())), "tests": tests,
             "alpha_per_test": info["alpha"], "bonferroni": bonferroni,
             "n_subjects": len(ref[0]), "n_folds": n_folds, "best_trials": trials}

@@ -1,5 +1,5 @@
 """
-Best trial per (arm, n_subtypes) of an experiment, read-only.
+Best trial (lowest CVIC by default) per (arm, n_subtypes) of an experiment, read-only.
 
     python scripts/summarize_study.py experiments/<dated> [--keys val_lse cv_cvic ...]
 
@@ -15,7 +15,7 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 from optuna.trial import TrialState
 
-DEFAULT_KEYS = ("cv_lse", "cv_cvic", "val_lse", "val_lse_unweighted", "val_mse_imaging",
+DEFAULT_KEYS = ("cv_cvic", "cv_lse", "val_lse", "val_lse_unweighted", "val_mse_imaging",
                 "val_mse_clinical", "bic", "bic_gauss", "n_f_active", "s_median_all")
 
 
@@ -23,6 +23,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("exp_dir")
     ap.add_argument("--keys", nargs="+", default=list(DEFAULT_KEYS))
+    ap.add_argument("--by", default="cv_cvic", help="trial attr defining 'best' ('objective' = study objective)")
     args = ap.parse_args()
 
     rows = []
@@ -34,8 +35,10 @@ def main():
             arm_dir = os.path.relpath(os.path.dirname(journal), args.exp_dir)
             row = {"study": arm_dir, "n_complete": len(done),
                    "n_failed": sum(t.state == TrialState.FAIL for t in study.trials)}
+            if args.by != "objective":
+                done = [t for t in done if t.user_attrs.get(args.by) is not None]
             if done:
-                best = min(done, key=lambda t: t.value)
+                best = min(done, key=lambda t: t.value if args.by == "objective" else t.user_attrs[args.by])
                 row.update(best_trial=best.number, value=best.value, params=best.params,
                            **{k: best.user_attrs.get(k) for k in args.keys})
             rows.append(row)
