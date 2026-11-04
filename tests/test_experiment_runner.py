@@ -11,6 +11,7 @@ optuna = pytest.importorskip("optuna")
 from COMIND_transformer.experiment import runner
 from COMIND_transformer.experiment.config import load_config
 from COMIND_transformer.experiment.data import Dataset, biomarker_weights
+from COMIND_transformer.experiment.selection import select_z
 from COMIND_transformer.subtyping_em_transformer import SubtypingEM
 
 from test_zsym_weights import _zsym_toy
@@ -62,7 +63,8 @@ def test_biomarker_weights_share():
     assert biomarker_weights(groups, None) is None
 
 
-def test_one_trial_end_to_end(config_path, monkeypatch):
+@pytest.fixture
+def data(monkeypatch):
     toy = _zsym_toy([2.0] * 4, n_pat=30)
     pats = toy["pats"]
     for p in pats:
@@ -72,7 +74,10 @@ def test_one_trial_end_to_end(config_path, monkeypatch):
     fake = types.SimpleNamespace(load=lambda *a, **k: data,
                                  external_checks=lambda est, d, b, z: {"n_val_placed": int(len(z))})
     monkeypatch.setitem(runner.LOADERS, "adni", fake)
+    return data
 
+
+def test_one_trial_end_to_end(config_path, data):
     cfg = load_config(config_path, arm="S2")
     exp_dir = os.path.dirname(config_path)
     study = runner.run_worker(cfg, exp_dir, config_path=config_path)
@@ -97,3 +102,19 @@ def test_one_trial_end_to_end(config_path, monkeypatch):
     assert saved["val_ids"].tolist() == [p["id"] for p in data.x_val]
     np.testing.assert_allclose(est.transform(data.x_val)["beta"], saved["val_beta"])
     assert est.lambda_f == pytest.approx(trial.params["lambda_f"])
+    assert saved["cv_loglik"].shape == (24,) and sorted(set(saved["cv_fold"])) == [0, 1, 2]
+    assert trial.user_attrs["cv_cvic"] == pytest.approx(-2 * saved["cv_loglik"].sum())
+    assert sum(trial.user_attrs["cv_cvic_folds"]) == pytest.approx(trial.user_attrs["cv_cvic"])
+
+
+def test_select_z_across_studies(config_path, data):
+    exp_dir = os.path.dirname(config_path)
+    for z in (1, 2):
+        runner.run_worker(load_config(config_path, arm="S0", n_subtypes=z), exp_dir, config_path=config_path)
+    res = select_z(exp_dir, "S0", n_draw=2000)
+    assert res["candidates"] == [1, 2] and res["selected_n_subtypes"] in (1, 2)
+    assert res["n_subjects"] == 24 and res["n_folds"] == 3
+    for z in (1, 2):
+        assert res["cvic"][z] == pytest.approx(res["best_trials"][z]["cv_cvic"])
+    assert len(res["tests"]) == 1
+    json.dumps(res)

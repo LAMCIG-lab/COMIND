@@ -1,7 +1,8 @@
 # ADNI, z-score input, scale vs zsym and clinical reweighting (S0-S3).
 # Same setup as 2026_10_28_ADNI_lse_rescale_reweighting, on the shared runner.
 #   python scripts/run_experiment.py <this file> --arm S1 --smoke
-#   python scripts/submit_arms.py <this file> --n-subtypes 2 3 4 --workers 16
+#   python scripts/submit_arms.py <this file> --n-subtypes 1 2 3 4 5 --workers 16
+#   python scripts/select_z.py <this folder>   # ordered Tukey test on CVIC, per arm
 dataset: adni
 data_csv: $COMIND_DATA/adni/yuto_obs_v2/ADNI_longitudinal_yuto_obs_harmonized.csv
 connectome: $COMIND_DATA/iit_connectivity_matrix/connectome_experiment_10_19_2026/K_82_log_knn8_row.csv

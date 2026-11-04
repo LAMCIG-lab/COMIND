@@ -81,15 +81,16 @@ def forecast_mse(est, X) -> float:
     return float(np.sum(resid[ok] ** 2) / max(int(ok.sum()), 1))
 
 
-def make_cv_scorer(groups: Dict[str, np.ndarray], *, forecast: bool, cvic: bool):
-    """Multi-metric scorer for ``cross_validate``: one ``transform`` per fold for the MSEs."""
+def make_cv_scorer(groups: Dict[str, np.ndarray], *, forecast: bool):
+    """Multi-metric scorer for ``cross_validate``: one ``transform`` per fold for the MSEs.
+
+    CVIC is not here: the runner needs it per subject, not per fold.
+    """
     def scorer(est, X, y=None):
         s = held_out_scores(est, X, groups)
         out = {k: v for k, v in s.items() if k not in ("beta", "subtype")}
         if forecast:
             out["forecast"] = forecast_mse(est, X)
-        if cvic:
-            out["cvic"] = est.score_cvic(X)
         return out
     return scorer
 

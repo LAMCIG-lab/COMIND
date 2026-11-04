@@ -50,7 +50,7 @@ class ExperimentConfig:
     clinical_weight_share: Optional[float] = None  # None = equal biomarker weights
     objective: str = "cv_lse"
     cv_folds: int = 3
-    cvic: bool = True  # also score held-out CVIC in every CV fold (used to compare Z)
+    cvic: bool = True  # held-out CVIC per subject in every CV fold; needed by scripts/select_z.py
     polish_f: bool = False
     search_space: Dict[str, list] = field(default_factory=lambda: copy.deepcopy(DEFAULT_SEARCH_SPACE))
     n_trials: int = 200

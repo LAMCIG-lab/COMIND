@@ -6,8 +6,9 @@ and NOTES.md):
 
     <arm>/k<Z>/journal.log        Optuna journal; every scalar result lives in
                                   trial user_attrs
-    <arm>/k<Z>/trials/NNNN.npz    SubtypingEM.save(): fitted model plus val
-                                  placement and subject IDs (subject-level data)
+    <arm>/k<Z>/trials/NNNN.npz    SubtypingEM.save(): fitted model, val placement,
+                                  subject IDs and per-subject held-out CVIC
+                                  log densities (subject-level data)
     <arm>/k<Z>/manifest.json      git commit, resolved config, versions
     <arm>/k<Z>/lambda_f_max.json  lambda_f calibration, written once
 """
@@ -85,23 +86,34 @@ def open_study(journal: str, name: str, n_startup: int) -> optuna.Study:
 
 
 def make_objective(cfg: ExperimentConfig, data: Dataset, base: SubtypingEM, trials_dir: str):
-    scorer = make_cv_scorer(data.groups, forecast=True, cvic=cfg.cvic or cfg.objective == "cvic")
+    scorer = make_cv_scorer(data.groups, forecast=True)
+    cvic = cfg.cvic or cfg.objective == "cvic"
 
     def objective(trial: optuna.Trial) -> float:
         t0 = time.perf_counter()
         params = {n: trial.suggest_float(n, lo, hi, log=log) for n, (lo, hi, log) in cfg.search_space.items()}
         est = clone(base).set_params(**params)
         attrs: Dict[str, Any] = {}
+        cv_extra: Dict[str, np.ndarray] = {}
         if cfg.uses_cv:
-            cv = cross_validate(clone(est).set_params(n_init=1), data.x_train,
-                                cv=KFold(cfg.cv_folds, shuffle=True, random_state=cfg.seed),
-                                scoring=scorer, error_score="raise")
+            # Same seed and same x_train for every Z, so every Z study sees the same folds,
+            # which the ordered Tukey test (scripts/select_z.py) needs.
+            splits = list(KFold(cfg.cv_folds, shuffle=True, random_state=cfg.seed).split(data.x_train))
+            cv = cross_validate(clone(est).set_params(n_init=1), data.x_train, cv=splits,
+                                scoring=scorer, error_score="raise", return_estimator=cvic)
             for key, folds in cv.items():
                 if key.startswith("test_"):
-                    # CVIC is -2 log-lik summed over subjects, each held out once.
-                    agg = np.sum if key == "test_cvic" else np.mean
-                    attrs[f"cv_{key[5:]}"] = float(agg(folds))
+                    attrs[f"cv_{key[5:]}"] = float(np.mean(folds))
                     attrs[f"cv_{key[5:]}_folds"] = folds.tolist()
+            if cvic:
+                # Held-out log density of every training subject, from the fold that left it out.
+                loglik, fold = np.empty(len(data.x_train)), np.empty(len(data.x_train), dtype=int)
+                for i, (fold_est, (_, test)) in enumerate(zip(cv["estimator"], splits)):
+                    loglik[test] = fold_est.subject_loglik_cvic([data.x_train[j] for j in test])
+                    fold[test] = i
+                attrs["cv_cvic"] = float(-2.0 * loglik.sum())
+                attrs["cv_cvic_folds"] = [float(-2.0 * loglik[fold == i].sum()) for i in range(len(splits))]
+                cv_extra = {"cv_loglik": loglik, "cv_fold": fold}
 
         est.fit(data.x_train)
         if cfg.polish_f:
@@ -121,7 +133,7 @@ def make_objective(cfg: ExperimentConfig, data: Dataset, base: SubtypingEM, tria
         est.save(path, histories=cfg.save_histories,
                  train_ids=[str(p["id"]) for p in data.x_train],
                  val_ids=[str(p["id"]) for p in data.x_val],
-                 val_beta=val["beta"], val_subtype=val["subtype"])
+                 val_beta=val["beta"], val_subtype=val["subtype"], **cv_extra)
         for key, v in json_safe(attrs).items():
             trial.set_user_attr(key, v)
         print(f"trial {trial.number}: {cfg.objective}={value:.6g} val_lse={attrs['val_lse']:.6g} "
