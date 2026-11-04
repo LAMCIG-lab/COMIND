@@ -118,3 +118,19 @@ def test_select_z_across_studies(config_path, data):
         assert res["cvic"][z] == pytest.approx(res["best_trials"][z]["cv_cvic"])
     assert len(res["tests"]) == 1
     json.dumps(res)
+
+
+def test_results_loader(config_path, data):
+    from COMIND_transformer.experiment import results as R
+    exp_dir = os.path.dirname(config_path)
+    runner.run_worker(load_config(config_path, arm="S2"), exp_dir, config_path=config_path)
+    out = os.path.join(exp_dir, "S2", "k2")
+    df = R.trials_table(out)
+    assert list(df.index) == [0] and {"bic", "cv_cvic", "lambda_f"} <= set(df.columns)
+    t = R.load_trial(out, 0)
+    assert t.subjects.split.value_counts().to_dict() == {"train": 24, "val": 6}
+    np.testing.assert_allclose(t.subjects.query("split == 'val'").beta, t.npz["val_beta"])
+    t_span, traj = R.trajectories(t.est)
+    assert traj.shape == (2, len(t_span), 4)
+    assert len(R.visits(t)) == sum(np.isfinite(p["X_obs"]).sum() for p in data.x_train + data.x_val)
+    assert len(R.visit_metadata(t)) == sum(len(p["dt"]) for p in data.x_train + data.x_val)
