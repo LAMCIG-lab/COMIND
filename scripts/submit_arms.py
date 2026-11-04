@@ -47,7 +47,7 @@ def main():
             load_config(config, arm=None if arm == "main" else arm, n_subtypes=z)  # validate now
             logs = os.path.join(exp_dir, arm, f"k{z}", "logs")
             cmd = ["qsub", "-N", f"{os.path.basename(exp_dir)[:8]}_{arm}_k{z}", "-o", logs + "/",
-                   "-t", f"0-{n_workers - 1}",
+                   "-t", "0" if n_workers == 1 else f"0-{n_workers - 1}",  # Torque rejects "0-0"
                    "-v", env,
                    os.path.join(ROOT, "scripts", "submit.pbs")]
             if args.dry_run:
