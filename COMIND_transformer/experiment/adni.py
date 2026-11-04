@@ -28,6 +28,7 @@ CLINICAL_Z = {"MOCA": ("MOCA__raw", -1.0), "ADAS13": ("ADAS13__raw", 1.0)}
 METADATA_COLS = [
     "DX", "DX_bl", "AGE", "PTGENDER", "APOE4", "MMSE", "CDRSB", "obs_type", "AV45", "FBB",
     "ABETA", "amyloid", "wscore_ref", "MOCA__raw", "ADAS13__raw", "MMSE__raw",
+    "TAU", "PTAU", "ABETA_bl", "TAU_bl", "PTAU_bl",  # CSF, raw strings ("<8"); validation only
 ]
 MCI_BL = {"MCI", "EMCI", "LMCI"}
 MOCA_TO_PRED_MMSE = {
