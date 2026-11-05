@@ -97,3 +97,13 @@ def test_inner_ftol_reaches_globals_and_f_steps(toy, monkeypatch):
     seen.clear()
     _em(toy, init="given", n_init=1, max_iter=1).fit(toy["pats"])
     assert 1e-7 not in seen
+
+
+def test_zsym_start_is_middle_of_s_bounds(toy):
+    assert _em(toy)._zsym_s0() == 2.0                                   # bounds [1, 3]
+    assert _em(toy, s_lower_value=2.0, s_upper=4.0)._zsym_s0() == 3.0
+    assert _em(toy, s_lower_value=None, s_upper=None)._zsym_s0() == 2.0
+    em = _em(toy, s_lower_value=2.0, s_upper=4.0).fit(toy["pats"])
+    s = np.ravel(em.final_s_clip)
+    assert s.min() >= 2.0 - 1e-9 and s.max() <= 4.0 + 1e-9
+

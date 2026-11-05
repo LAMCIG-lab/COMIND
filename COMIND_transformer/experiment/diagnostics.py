@@ -154,7 +154,7 @@ def fit_summary(est, X, groups: Dict[str, np.ndarray]) -> Dict[str, Any]:
 def lambda_f_max_report(est, X, search_range: List[float], seed: int) -> Dict[str, Any]:
     """lasso lambda_max for f at kappa = 0, scalar_K = 0.25, the MixedLM beta and random z.
 
-    s = 1 for the scale model; zsym uses the starting clipping level s0 = 2.
+    s = 1 for the scale model; zsym uses the starting clipping level s0 (``est._zsym_s0()``).
     """
     B = np.asarray(est.K).shape[0]
     t_span = np.linspace(0.0, est.t_max, int(est.t_max / est.step))
@@ -164,7 +164,8 @@ def lambda_f_max_report(est, X, search_range: List[float], seed: int) -> Dict[st
     s = np.ones(B)
     if est._is_zsym():
         data, meta = packed
-        packed, s = (jc.shift_data(data, jc.f64(np.full(B, -2.0))), meta), np.full(B, 4.0)
+        s0 = est._zsym_s0()
+        packed, s = (jc.shift_data(data, jc.f64(np.full(B, -s0))), meta), np.full(B, 2.0 * s0)
     lam, pull0 = lambda_f_max(packed, s, np.zeros(B), 0.25, beta, z, est.K, t_span, est.n_subtypes)
     lo, hi = search_range
     return {"lambda_f_max": float(lam), "search_range_over_lambda_f_max": [lo / lam, hi / lam],

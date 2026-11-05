@@ -65,7 +65,7 @@ _BACKENDS = {"numpy", "jax"}
 _ESTEP_MODES = {"current", "joint_grid"}
 _OBS_MODELS = ("scale", "zsym")
 _INITS = ("given", "kmeans")
-_ZSYM_S0 = 2.0  # zsym start: middle of the agreed s bounds [1, 3]
+_ZSYM_S0 = 2.0  # zsym start when the s bounds are not both set (the middle of [1, 3])
 _AT_UPPER_TOL = 1e-3
 
 
@@ -237,8 +237,8 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     prediction is ``s * (2 x - 1)`` on [-s, s]. It runs on the intercept path
     with ``final_s = 2 s`` and ``final_c = -s`` tied to s; the fitted s itself
     is ``final_s_clip``. Bounds ``s_lower_value`` / ``s_upper`` apply to s,
-    ``initial_s`` is s (default 2), and ``lambda_c`` is not used. The default
-    ``"scale"`` is the plain ``s * x`` model.
+    ``initial_s`` is s (default: the middle of the s bounds, else 2), and
+    ``lambda_c`` is not used. The default ``"scale"`` is the plain ``s * x`` model.
 
     ``biomarker_weights`` (JAX only, shape (B,), default None = ones) weights
     biomarker b's squared residuals by ``w_b`` in every fitting step and in
@@ -500,6 +500,13 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
     def _is_zsym(self) -> bool:
         return getattr(self, "obs_model", "scale") == "zsym"
 
+    def _zsym_s0(self) -> float:
+        """zsym starting clipping level: the middle of [s_lower_value, s_upper] when both are scalars."""
+        lo, hi = self.s_lower_value, self.s_upper
+        if lo is not None and hi is not None and np.ndim(hi) == 0:
+            return 0.5 * (float(lo) + float(hi))
+        return _ZSYM_S0
+
     def _uses_shift(self) -> bool:
         """True when predictions are ``c + s * x`` (free intercept or zsym)."""
         return bool(self.fit_intercept) or self._is_zsym()
@@ -565,7 +572,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             start = initial_values(
                 r, X, self.n_subtypes, c0, cols, self.scalar_K_center, self.random_state,
                 init_scalar_k_cap=self.init_scalar_k_cap,
-                zsym_s0=_ZSYM_S0 if self._is_zsym() else None,
+                zsym_s0=self._zsym_s0() if self._is_zsym() else None,
             )
             em = clone(self).set_params(
                 init="given",
@@ -1547,7 +1554,7 @@ class SubtypingEM(BaseEstimator, TransformerMixin):
             if s.shape != (n_biomarkers,):
                 raise ValueError(f"initial_s must have shape ({n_biomarkers},), got {s.shape}")
         elif self._is_zsym():
-            s = np.full(n_biomarkers, _ZSYM_S0)
+            s = np.full(n_biomarkers, self._zsym_s0())
         else:
             s = rng.uniform(0.1, 3, size=n_biomarkers)
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Generic COMIND worker array. Submitted by scripts/submit_arms.py, which sets
-# -N, -o, -t and -v CONFIG=...,ARM=...,NSUB=...,COMIND_ROOT=...
+# -N, -o, -t and -v CONFIG=...,ARM=...,NSUB=...,COMIND_ROOT=...[,COMIND_DATA=...][,N_TRIALS=...]
 #PBS -l nodes=1:ppn=1
 #PBS -l walltime=72:00:00
 #PBS -l mem=8gb
@@ -14,6 +14,7 @@ conda activate comind
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1
 export PYTHONPATH="${COMIND_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export XLA_FLAGS="${XLA_FLAGS:-} --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
-echo "PBS_JOBID=${PBS_JOBID:-} PBS_ARRAYID=${ARRAY_ID} CONFIG=${CONFIG} ARM=${ARM} NSUB=${NSUB}"
+echo "PBS_JOBID=${PBS_JOBID:-} PBS_ARRAYID=${ARRAY_ID} CONFIG=${CONFIG} ARM=${ARM} NSUB=${NSUB} N_TRIALS=${N_TRIALS:-config}"
 sleep $(( 3 * ARRAY_ID ))  # stagger journal opens
-python "${COMIND_ROOT}/scripts/run_experiment.py" "${CONFIG}" --arm "${ARM}" --n-subtypes "${NSUB}"
+python "${COMIND_ROOT}/scripts/run_experiment.py" "${CONFIG}" --arm "${ARM}" --n-subtypes "${NSUB}" \
+    ${N_TRIALS:+--n-trials "${N_TRIALS}"}

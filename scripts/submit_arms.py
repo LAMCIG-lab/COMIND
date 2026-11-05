@@ -4,6 +4,7 @@ qsub one worker array per (arm, n_subtypes) of an experiment config.
     python scripts/submit_arms.py experiments/<dated>/config.yaml --n-subtypes 3 4 --workers 16
     python scripts/submit_arms.py <config> --n-subtypes 1 2 3 4 5 --workers 6 12 16 20 24
     python scripts/submit_arms.py <config> --n-subtypes 4 --arms S1 S2 --dry-run   # print qsub lines
+    python scripts/submit_arms.py <config> --arms W0 --n-subtypes 1 2 3 4 5 --workers 20 --n-trials 200  # extend
 
 Fit time grows about linearly with Z (Z=5 is ~8x Z=1), so one worker count per Z
 lets every study finish at about the same time. Arms are submitted in the order
@@ -30,6 +31,7 @@ def main():
     ap.add_argument("--arms", nargs="+", help="default: every arm in the config")
     ap.add_argument("--workers", type=int, nargs="+", default=[16],
                     help="array size per (arm, Z): one number, or one per --n-subtypes value")
+    ap.add_argument("--n-trials", type=int, help="override the config's study budget, e.g. to extend finished studies")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -44,6 +46,8 @@ def main():
     for arm in arms:
         for z, n_workers in zip(args.n_subtypes, workers):
             env = f"CONFIG={config},ARM={arm},NSUB={z},COMIND_ROOT={ROOT}{data_root}"
+            if args.n_trials:
+                env += f",N_TRIALS={args.n_trials}"
             load_config(config, arm=None if arm == "main" else arm, n_subtypes=z)  # validate now
             logs = os.path.join(exp_dir, arm, f"k{z}", "logs")
             cmd = ["qsub", "-N", f"{os.path.basename(exp_dir)[:8]}_{arm}_k{z}", "-o", logs + "/",
